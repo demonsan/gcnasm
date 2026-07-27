@@ -119,6 +119,10 @@ int main(int argc, char** argv) {
     int N = 512;
     int K = 128;
     int batch = 8;
+    int warmup = 50;
+    int iters = 100;
+    bool validate = true;
+    bool quad_only = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -130,15 +134,24 @@ int main(int argc, char** argv) {
             K = std::atoi(argv[++i]);
         } else if ((std::strcmp(arg, "-b") == 0 || std::strcmp(arg, "--b") == 0) && i + 1 < argc) {
             batch = std::atoi(argv[++i]);
+        } else if (std::strcmp(arg, "--warmup") == 0 && i + 1 < argc) {
+            warmup = std::atoi(argv[++i]);
+        } else if (std::strcmp(arg, "--iters") == 0 && i + 1 < argc) {
+            iters = std::atoi(argv[++i]);
+        } else if (std::strcmp(arg, "--no-validate") == 0) {
+            validate = false;
+        } else if (std::strcmp(arg, "--quad-only") == 0) {
+            quad_only = true;
         }
     }
 
-    if (M <= 0 || N <= 0 || K <= 0 || batch <= 0) {
-        std::cerr << "Invalid problem size: M,N,K and batch must be positive.\n";
+    if (M <= 0 || N <= 0 || K <= 0 || batch <= 0 || warmup < 0 || iters <= 0) {
+        std::cerr << "Invalid problem size or benchmark config.\n";
         return 1;
     }
 
-    printf("BF16 GEMM: M=%d, N=%d, K=%d, Batch=%d\n", M, N, K, batch);
+    printf("BF16 GEMM: M=%d, N=%d, K=%d, Batch=%d, warmup=%d, iters=%d, validate=%d\n",
+           M, N, K, batch, warmup, iters, validate ? 1 : 0);
 
     // Allocate host buffers (one shared A/B and one CPU reference; per-kernel C-out).
     auto host_a       = std::make_unique<bf16_t[]>(batch * M * K);
@@ -175,13 +188,17 @@ int main(int argc, char** argv) {
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    printf("Computing CPU reference ...\n");
-    for(int b = 0; b < batch; b++) {
-        gemm_ref(
-            host_a.get() + b * M * K,
-            host_b.get() + b * N * K,
-            host_c_ref.get() + b * M * N,
-            M, N, K, K, K, N);
+    if (validate) {
+        printf("Computing CPU reference ...\n");
+        for(int b = 0; b < batch; b++) {
+            gemm_ref(
+                host_a.get() + b * M * K,
+                host_b.get() + b * N * K,
+                host_c_ref.get() + b * M * N,
+                M, N, K, K, K, N);
+        }
+    } else {
+        printf("Skipping CPU reference / validation.\n");
     }
 
     struct kernel_result { const char* label; bool ok; int passed; int total; float ms; float tflops; };
@@ -199,21 +216,27 @@ int main(int argc, char** argv) {
                label, Traits::B_M, Traits::B_N, Traits::B_K,
                grid.x, grid.y, grid.z, (int)block.x);
 
-        launch();
-        CHECK_HIP_KERNEL_LAUNCH();
-        CHECK_HIP(hipMemcpy(host_c_out, dev_c, batch * M * N * sizeof(bf16_t), hipMemcpyDeviceToHost));
-
         int passed = 0;
-        for(int b = 0; b < batch; b++) {
-            if (valid_vector(host_c_ref.get() + b * M * N, host_c_out + b * M * N, M * N, 5e-1f)) {
-                ++passed;
-            }
-        }
-        const bool ok = (passed == batch);
-        printf("  validate : %s  (%d/%d batches)\n",
-               ok ? "PASS" : "FAIL", passed, batch);
+        bool ok = true;
+        if (validate) {
+            launch();
+            CHECK_HIP_KERNEL_LAUNCH();
+            CHECK_HIP(hipMemcpy(host_c_out, dev_c, batch * M * N * sizeof(bf16_t), hipMemcpyDeviceToHost));
 
-        auto bench = benchmark_kernel(launch, kargs);
+            for(int b = 0; b < batch; b++) {
+                if (valid_vector(host_c_ref.get() + b * M * N, host_c_out + b * M * N, M * N, 5e-1f)) {
+                    ++passed;
+                }
+            }
+            ok = (passed == batch);
+            printf("  validate : %s  (%d/%d batches)\n",
+                   ok ? "PASS" : "FAIL", passed, batch);
+        } else {
+            passed = batch;
+            printf("  validate : SKIP\n");
+        }
+
+        auto bench = benchmark_kernel(launch, kargs, warmup, iters);
         printf("  perf    : %7.4f ms  %8.2f TFlops\n", bench.avg_ms, bench.tflops);
 
         return {label, ok, passed, batch, bench.avg_ms, bench.tflops};
@@ -224,13 +247,15 @@ int main(int argc, char** argv) {
 
     auto r_quad = run(TraitsQuad{}, gemm_a16w16_quad_subtile_kernel<TraitsQuad>,
                       host_c_256.get(), "quad_subtile 256x256");
-    auto r_mono = run(TraitsMono{}, gemm_a16w16_mono_tile_kernel<TraitsMono>,
-                      host_c_192.get(), "mono_tile    192x256");
 
     printf("\nSummary\n");
-    for (const auto& r : {r_quad, r_mono}) {
-        printf("  %-22s  %s  %8.2f TFlops\n",
-               r.label, r.ok ? "PASS" : "FAIL", r.tflops);
+    printf("  %-22s  %s  %7.4f ms  %8.2f TFlops\n",
+           r_quad.label, r_quad.ok ? "PASS" : "FAIL", r_quad.ms, r_quad.tflops);
+    if (!quad_only) {
+        auto r_mono = run(TraitsMono{}, gemm_a16w16_mono_tile_kernel<TraitsMono>,
+                          host_c_192.get(), "mono_tile    192x256");
+        printf("  %-22s  %s  %7.4f ms  %8.2f TFlops\n",
+               r_mono.label, r_mono.ok ? "PASS" : "FAIL", r_mono.ms, r_mono.tflops);
     }
 
     CHECK_HIP(hipFree(dev_a));
