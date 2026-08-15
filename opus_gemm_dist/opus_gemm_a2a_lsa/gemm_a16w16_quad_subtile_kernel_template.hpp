@@ -7,26 +7,60 @@
 
 #include <opus/opus.hpp>
 #include "gemm_defs.h"
+#include "mori/cco/cco.hpp"
 
-#ifndef OPUS_STORE_PIPELINE
-#define OPUS_STORE_PIPELINE 3
-#endif
+// Retained optimization: multiple compute WGs may finish chunks for the same
+// peer concurrently, so serialize only the short no-signal SDMA queue submit
+// instead of serializing the GEMM work.
+static __device__ __attribute__((noinline)) inline void opus_chunk_sdma_submit(
+    void* dev_comm_ptr, void* staging_win_ptr, void* recv_win_ptr,
+    unsigned int* peer_lock, int dst, size_t src_offset,
+    size_t dst_offset, size_t bytes) {
+    while (__atomic_exchange_n(peer_lock + dst, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        __builtin_amdgcn_s_sleep(1);
+    }
+    auto* dev_comm = static_cast<mori::cco::ccoDevComm*>(dev_comm_ptr);
+    mori::cco::ccoSdma{*dev_comm}.put<mori::cco::ccoCoopThread>(
+        dst, reinterpret_cast<mori::cco::ccoWindow_t>(recv_win_ptr), dst_offset,
+        reinterpret_cast<mori::cco::ccoWindow_t>(staging_win_ptr), src_offset,
+        bytes, 0);
+    __atomic_store_n(peer_lock + dst, 0u, __ATOMIC_RELEASE);
+}
 
-#ifndef OPUS_C_STORE_MODE
-#define OPUS_C_STORE_MODE 2
-#endif
-
-#ifndef OPUS_STORE_STAGGER_PHASES
-#define OPUS_STORE_STAGGER_PHASES 16
-#endif
-
-#ifndef OPUS_STORE_STAGGER_DELAY
-#define OPUS_STORE_STAGGER_DELAY 4
-#endif
-
-#ifndef OPUS_TILE_ORDER
-#define OPUS_TILE_ORDER 1
-#endif
+// Retained optimization: process two M tiles before rotating to a destination,
+// and rotate peer order by source rank. This breaks synchronized all-rank
+// incast while preserving enough adjacent-tile locality for GEMM.
+static __device__ __attribute__((always_inline)) inline unsigned long long
+opus_direct_stripe_tile(
+    int tile_linear,
+    int num_tiles_m,
+    int tiles_per_peer,
+    int num_peer_tiles,
+    int scatter_tiles,
+    int my_rank) {
+    const int scatter_tile_count = scatter_tiles * num_tiles_m;
+    int m_tile;
+    int n_tile;
+    if (tile_linear < scatter_tile_count) {
+        const int m_stripe = num_tiles_m < 2 ? num_tiles_m : 2;
+        const int m_in_stripe = tile_linear % m_stripe;
+        int stripe_sequence = tile_linear / m_stripe;
+        const int peer_slot = stripe_sequence % num_peer_tiles;
+        stripe_sequence /= num_peer_tiles;
+        const int m_group = stripe_sequence % (num_tiles_m / m_stripe);
+        const int inner = stripe_sequence / (num_tiles_m / m_stripe);
+        const int peer = (peer_slot + my_rank) % num_peer_tiles;
+        m_tile = m_group * m_stripe + m_in_stripe;
+        n_tile = peer * tiles_per_peer + inner;
+    } else {
+        const int tail_linear = tile_linear - scatter_tile_count;
+        m_tile = tail_linear % num_tiles_m;
+        n_tile = scatter_tiles + tail_linear / num_tiles_m;
+    }
+    return (static_cast<unsigned long long>(
+                static_cast<unsigned int>(m_tile)) << 32) |
+           static_cast<unsigned int>(n_tile);
+}
 
 #ifndef OPUS_PERSISTENT
 #define OPUS_PERSISTENT 1
@@ -249,9 +283,14 @@ inline __device__ auto make_layout_gc(int lane_id, int wave_id_m, int wave_id_n,
 
 } // namespace gemm_quad_subtile
 
-template<typename UserTraits>
+template<typename UserTraits,
+         bool LocalStaging = false,
+         bool ChunkFused = false,
+         bool DirectStriped = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
+    static_assert(!ChunkFused || LocalStaging);
+    static_assert(!DirectStriped || (!LocalStaging && !ChunkFused));
     using namespace opus;
     using namespace gemm_quad_subtile;
     using opus::operator""_I;
@@ -269,64 +308,74 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
     const int total_tiles = tile_count * kargs.batch;
 #if OPUS_PERSISTENT
     __shared__ unsigned int next_tile_id;
-#if OPUS_STORE_PIPELINE == 2
-    int carried_tile_id = -1;
-    bool have_carried_tile = false;
-    bool carried_initial_loads = false;
-#endif
-#endif
-
-#if OPUS_PERSISTENT
     while (true) {
         int tile_id = -1;
-        bool initial_loads_prefetched = false;
-#if OPUS_STORE_PIPELINE == 2
-        if (have_carried_tile) {
-            tile_id = carried_tile_id;
-            initial_loads_prefetched = carried_initial_loads;
-            have_carried_tile = false;
-            carried_initial_loads = false;
-        } else
-#endif
-        {
         if (opus::thread_id_x() == 0) {
             next_tile_id = __atomic_fetch_add(kargs.tile_counter, 1u, __ATOMIC_RELAXED);
         }
         __builtin_amdgcn_s_barrier();
 
         tile_id = static_cast<int>(next_tile_id);
-        }
 #else
     {
         const int tile_id = static_cast<int>(opus::block_id_x());
-        constexpr bool initial_loads_prefetched = false;
 #endif
         if (tile_id >= total_tiles) {
             return;
         }
         const int batch_id = tile_id / tile_count;
         const int tile_linear = tile_id - batch_id * tile_count;
-        const int m_tile = tile_linear % num_tiles_m;
+        int m_tile = tile_linear % num_tiles_m;
         const int n_tile_sequence = tile_linear / num_tiles_m;
         int n_tile = n_tile_sequence;
-#if OPUS_TILE_ORDER == 1
-        // Round-robin the scattered column tiles across destination peers:
-        // instead of processing all tiles for peer0, then peer1, etc., issue
-        // peer0/peer1/peer2/peer3 in sequence for each inner tile. This spreads
-        // remote LSA store bursts across xGMI peers and was the largest
-        // short-term win in testing (roughly +25% on M=8192,N=36864 with
-        // STORE_PIPELINE=3 and C_STORE_MODE=2).
+        // Retained optimization: round-robin scattered column tiles across
+        // destination peers. Chunk mode additionally makes each M chunk
+        // contiguous so its PUT can start early, and rotates peers by source
+        // rank to avoid synchronized all-rank incast.
         if (kargs.a2a_n_shard && kargs.a2a_span > 0) {
             const int tiles_per_peer = kargs.a2a_n_shard / T::B_N;
             const int num_peer_tiles = kargs.a2a_span / kargs.a2a_n_shard;
             const int scatter_tiles = tiles_per_peer * num_peer_tiles;
-            if (tiles_per_peer > 0 && num_peer_tiles > 0 && n_tile_sequence < scatter_tiles) {
+            if constexpr (ChunkFused) {
+                const int scatter_tile_count = scatter_tiles * num_tiles_m;
+                if (tiles_per_peer > 0 && num_peer_tiles > 0 &&
+                    tile_linear < scatter_tile_count) {
+                    const int chunk_m_tiles = kargs.chunk_m_tiles_per_put;
+                    const int m_in_chunk = tile_linear % chunk_m_tiles;
+                    int chunk_sequence = tile_linear / chunk_m_tiles;
+                    const int peer_slot = chunk_sequence % num_peer_tiles;
+                    chunk_sequence /= num_peer_tiles;
+                    const int inner = chunk_sequence % tiles_per_peer;
+                    const int chunk_group = chunk_sequence / tiles_per_peer;
+                    const int peer =
+                        (peer_slot + kargs.peer_lsa_rank) % num_peer_tiles;
+                    m_tile = chunk_group * chunk_m_tiles + m_in_chunk;
+                    n_tile = peer * tiles_per_peer + inner;
+                } else if (tile_linear >= scatter_tile_count) {
+                    const int tail_linear = tile_linear - scatter_tile_count;
+                    m_tile = tail_linear % num_tiles_m;
+                    n_tile = scatter_tiles + tail_linear / num_tiles_m;
+                }
+            }
+            else if constexpr (DirectStriped) {
+                if (tiles_per_peer > 0 && num_peer_tiles > 0) {
+                    const unsigned long long mapped = opus_direct_stripe_tile(
+                        tile_linear, num_tiles_m, tiles_per_peer,
+                        num_peer_tiles, scatter_tiles,
+                        kargs.peer_lsa_rank);
+                    m_tile = static_cast<int>(mapped >> 32);
+                    n_tile = static_cast<int>(mapped);
+                }
+            }
+            else
+            if (tiles_per_peer > 0 && num_peer_tiles > 0 &&
+                n_tile_sequence < scatter_tiles) {
                 const int inner = n_tile_sequence / num_peer_tiles;
-                const int peer = n_tile_sequence - inner * num_peer_tiles;
+                const int peer =
+                    n_tile_sequence - inner * num_peer_tiles;
                 n_tile = peer * tiles_per_peer + inner;
             }
         }
-#endif
         int row = m_tile * T::B_M;
         int col = n_tile * T::B_N;
 
@@ -345,11 +394,20 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
     // stay in the local full-width [M,N] buffer (ptr_c).
     if (kargs.a2a_n_shard && col < kargs.a2a_span) {
         int dst = col / kargs.a2a_n_shard;
-        int my  = cco_lsa_rank(kargs.cco_c_win);
         eff_stride_c = kargs.a2a_n_shard;
-        eff_row      = my * kargs.a2a_M + row;    // this rank's row-block in the receiver
         eff_col_bias = dst * kargs.a2a_n_shard;   // map global col -> local col (col%n_shard)
-        c_base = reinterpret_cast<D_C*>(cco_lsa_peer_c(kargs.cco_c_win, dst));
+        if constexpr (LocalStaging) {
+            // SDMA source layout: one contiguous [M, n_shard] slab per
+            // destination. The later bulk PUT maps this slab to this rank's
+            // row-block in the destination receive window.
+            eff_row = row;
+            c_base = reinterpret_cast<D_C*>(kargs.cco_c_win) +
+                     static_cast<size_t>(dst) * kargs.a2a_M * kargs.a2a_n_shard;
+        } else {
+            int my = cco_lsa_rank(kargs.cco_c_win);
+            eff_row = my * kargs.a2a_M + row;
+            c_base = reinterpret_cast<D_C*>(cco_lsa_peer_c(kargs.cco_c_win, dst));
+        }
     } else if (kargs.a2a_n_shard) {
         // non-scattered tail cols -> local full-width buffer at the true column.
         c_base = reinterpret_cast<D_C*>(kargs.ptr_c);
@@ -409,7 +467,6 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
     };
 
-    [[maybe_unused]] auto u_gc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, eff_stride_c);
     auto c_offset = [&](int half_tile_m, int half_tile_n) {
         return half_tile_m * T::HALF_B_M * eff_stride_c + half_tile_n * T::HALF_B_N + (col - eff_col_bias);
     };
@@ -428,32 +485,9 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
             p[1] = r1[0]; p[3] = r1[1];
         });
 
-#if OPUS_C_STORE_MODE == 1
-        // Reuse A LDS after compute is complete: first materialize the current
-        // 128x128 half-tile in row-major LDS, then have consecutive threads
-        // write consecutive vec8 chunks to global memory.
-        smem<D_C> s_c = make_smem(reinterpret_cast<D_C*>(smem_a + 2 * smem_a_byte));
-        auto u_sc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, T::HALF_B_N);
-        store<T::VEC_C>(s_c, v_c_f16, u_sc);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
-
-        constexpr int vectors_per_half_tile = T::HALF_B_M * T::HALF_B_N / T::VEC_C;
-        constexpr int vectors_per_thread = vectors_per_half_tile / T::BLOCK_SIZE;
-        static_assert(vectors_per_half_tile % T::BLOCK_SIZE == 0);
-        static_for<vectors_per_thread>([&](auto i) {
-            const int linear_vec = opus::thread_id_x() + i.value * T::BLOCK_SIZE;
-            auto v = load<T::VEC_C>(s_c, linear_vec * T::VEC_C);
-            s_waitcnt_lgkmcnt(0_I);
-            const int row_in_half = linear_vec / (T::HALF_B_N / T::VEC_C);
-            const int col_vec = linear_vec - row_in_half * (T::HALF_B_N / T::VEC_C);
-            store<T::VEC_C>(g_c, v, c_offset(half_tile_m, half_tile_n) + row_in_half * eff_stride_c + col_vec * T::VEC_C);
-        });
-        __builtin_amdgcn_s_barrier();
-#elif OPUS_C_STORE_MODE == 2
-        // Wave-local gather: for each 32-row slice, lanes (0,1), (2,3), ...
-        // write adjacent vec8 chunks of the same row. The source data is pulled
-        // from the original MFMA/store layout with ds_bpermute.
+        // Retained optimization: wave-local pair-coalesced C store. For each
+        // 32-row slice, adjacent lane pairs write adjacent vec8 chunks without
+        // the extra LDS staging and barriers used by the rejected store mode.
         static_for<num_chunks>([&](auto c) {
             auto* p = p_u32 + c.value * u32_per_chunk;
             const int lane = lane_id;
@@ -474,34 +508,15 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
             const int col_vec = half_col_block * 8 + wave_id_n * 2 + vec_pair;
             store<T::VEC_C>(g_c, v, c_offset(half_tile_m, half_tile_n) + row_in_half * eff_stride_c + col_vec * T::VEC_C);
         });
-#else
-        store<T::VEC_C>(g_c, v_c_f16, u_gc, c_offset(half_tile_m, half_tile_n));
-#endif
-    };
-
-    auto stagger_store_phase = [&]() {
-#if OPUS_STORE_STAGGER_PHASES > 0 && OPUS_STORE_STAGGER_DELAY > 0
-        // Lightly phase-shift C stores so persistent CTAs do not all hit the
-        // same remote-store path at once. Best tested setting was 16 phases and
-        // delay 4; by itself it was modest (~1%), but it composes with peer
-        // round-robin.
-        int phase = tile_id % OPUS_STORE_STAGGER_PHASES;
-        int spins = phase * OPUS_STORE_STAGGER_DELAY;
-        for (int i = 0; i < spins; ++i) {
-            __builtin_amdgcn_s_sleep(1);
-        }
-#endif
     };
 
     const int loops = ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
-    if (!initial_loads_prefetched) {
-        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0));
-        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0));
-        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
-        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
-    }
+    async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0));
+    async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0));
+    async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
+    async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
 
     if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
 
@@ -653,9 +668,6 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
-#if OPUS_STORE_PIPELINE == 1
-        store_c(v_c[0][0], 0, 0);
-#endif
 
         v_b[1] = load<T::VEC_B>(s_b[tic][1], u_rb);
         s_waitcnt_vmcnt(0_I);
@@ -666,9 +678,6 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
-#if OPUS_STORE_PIPELINE == 1
-        store_c(v_c[0][1], 0, 1);
-#endif
 
         v_a = load<T::VEC_A>(s_a[tic][1], u_ra);
         __builtin_amdgcn_s_barrier();
@@ -683,57 +692,53 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
 
     if (wave_id_m == 0) __builtin_amdgcn_s_barrier();
 
-#if OPUS_STORE_PIPELINE == 2 && OPUS_PERSISTENT
-    // Look ahead one persistent tile: issue its first A/B loads before storing
-    // this tile's C so the following compute can absorb part of store latency.
-    bool lookahead_valid = false;
-    if (opus::thread_id_x() == 0) {
-        next_tile_id = __atomic_fetch_add(kargs.tile_counter, 1u, __ATOMIC_RELAXED);
-    }
-    __builtin_amdgcn_s_barrier();
-    const int lookahead_tile_id = static_cast<int>(next_tile_id);
-    if (lookahead_tile_id < total_tiles) {
-        const int lookahead_batch_id = lookahead_tile_id / tile_count;
-        const int lookahead_tile_linear = lookahead_tile_id - lookahead_batch_id * tile_count;
-        const int lookahead_row = (lookahead_tile_linear % num_tiles_m) * T::B_M;
-        const int lookahead_col = (lookahead_tile_linear / num_tiles_m) * T::B_N;
-        auto lookahead_g_a = make_gmem(
-            reinterpret_cast<const D_A*>(kargs.ptr_a) + lookahead_batch_id * kargs.stride_a_batch + lookahead_row * kargs.stride_a,
-            (kargs.m - lookahead_row) * kargs.stride_a * sizeof(D_A));
-        auto lookahead_g_b = make_gmem(
-            reinterpret_cast<const D_B*>(kargs.ptr_b) + lookahead_batch_id * kargs.stride_b_batch + lookahead_col * kargs.stride_b,
-            (kargs.n - lookahead_col) * kargs.stride_b * sizeof(D_B));
-
-        async_load<T::VEC_B>(lookahead_g_b, s_b[0][0].ptr, u_gb, u_sb, b_offset(0, 0));
-        async_load<T::VEC_A>(lookahead_g_a, s_a[0][0].ptr, u_ga, u_sa, a_offset(0, 0));
-        async_load<T::VEC_B>(lookahead_g_b, s_b[0][1].ptr, u_gb, u_sb, b_offset(1, 0));
-        async_load<T::VEC_A>(lookahead_g_a, s_a[0][1].ptr, u_ga, u_sa, a_offset(1, 0));
-
-        carried_tile_id = lookahead_tile_id;
-        have_carried_tile = true;
-        carried_initial_loads = true;
-        lookahead_valid = true;
-    }
-#endif
-
-#if OPUS_STORE_PIPELINE == 1
-    stagger_store_phase();
-    store_c(v_c[1][0], 1, 0);
-    store_c(v_c[1][1], 1, 1);
-#else
-    stagger_store_phase();
+    // Retained optimization: store all four half-tiles together and omit the
+    // old post-store workgroup barrier, which was redundant for the next tile.
     store_c(v_c[0][0], 0, 0);
     store_c(v_c[0][1], 0, 1);
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
-#endif
-#if OPUS_STORE_PIPELINE != 3
-    __builtin_amdgcn_s_barrier();
-#endif
-#if OPUS_STORE_PIPELINE == 2 && OPUS_PERSISTENT
-    if (!lookahead_valid) {
-        return;
+    if constexpr (ChunkFused) {
+        // Retained optimization: publish a chunk as soon as all of its N tiles
+        // finish, allowing its SDMA PUT to overlap later GEMM chunks.
+        if (col < kargs.a2a_span) {
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            if (opus::thread_id_x() == 0) {
+                const int dst = col / kargs.a2a_n_shard;
+                const int chunk_group = m_tile / kargs.chunk_m_tiles_per_put;
+                const int counter_idx =
+                    dst * kargs.chunk_num_m_tiles + chunk_group;
+                const unsigned int previous = __atomic_fetch_add(
+                    kargs.chunk_done + counter_idx, 1u, __ATOMIC_ACQ_REL);
+                const unsigned int tiles_required =
+                    static_cast<unsigned int>(
+                        kargs.chunk_tiles_per_peer * kargs.chunk_m_tiles_per_put);
+                if (previous + 1u == tiles_required &&
+                    dst != cco_lsa_rank(
+                        reinterpret_cast<mori::cco::ccoWindow_t>(kargs.chunk_recv_win))) {
+                    auto* dev_comm =
+                        static_cast<mori::cco::ccoDevComm*>(kargs.chunk_dev_comm);
+                    const size_t bytes_per_peer =
+                        static_cast<size_t>(kargs.a2a_M) * kargs.a2a_n_shard * sizeof(D_C);
+                    const size_t chunk_bytes =
+                        static_cast<size_t>(T::B_M) *
+                        kargs.chunk_m_tiles_per_put *
+                        kargs.a2a_n_shard * sizeof(D_C);
+                    const size_t chunk_offset =
+                        static_cast<size_t>(chunk_group) * chunk_bytes;
+                    opus_chunk_sdma_submit(
+                        kargs.chunk_dev_comm, kargs.chunk_staging_win,
+                        kargs.chunk_recv_win, kargs.chunk_peer_lock, dst,
+                        static_cast<size_t>(kargs.chunk_staging_slot_offset) +
+                            static_cast<size_t>(dst) * bytes_per_peer + chunk_offset,
+                        static_cast<size_t>(dev_comm->lsaRank) * bytes_per_peer +
+                            chunk_offset,
+                        chunk_bytes);
+                }
+            }
+            __builtin_amdgcn_s_barrier();
+        }
     }
-#endif
     }
 }

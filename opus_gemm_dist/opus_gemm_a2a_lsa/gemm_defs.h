@@ -6,7 +6,6 @@
 #pragma once
 
 #include <type_traits>
-#include <cstddef>
 
 using bf16_t = __bf16;
 
@@ -54,8 +53,10 @@ struct opus_gemm_kargs {
     // Optional cco LSA peer-put target for the output C. When cco_c_win != nullptr
     // the kernel resolves the C base via ccoGetLsaPeerPtr(cco_c_win, peer_lsa_rank)
     // — i.e. it stores directly into the peer rank's window slot instead of ptr_c.
-    // Stored as void* to keep this header free of any cco/opus dependency; the
-    // kernel TU reinterprets it as ccoWindow_t. nullptr => use ptr_c (local).
+    // Stored as void* to keep this header free of any cco/opus dependency. The
+    // direct kernel reinterprets it as ccoWindow_t; the LocalStaging template
+    // variant instead treats it as a raw [dst, M, shard_n] local base pointer.
+    // nullptr => use ptr_c (local).
     void* cco_c_win = nullptr;
     int peer_lsa_rank = 0;
 
@@ -75,6 +76,17 @@ struct opus_gemm_kargs {
     int a2a_M = 0;        // per-rank row count (M); receiver row-block offset = lsaRank * M
     int a2a_span = 0;     // scatter width AN: cols [0,AN) scatter, cols [AN,n) stay local
     int stride_c_full = 0;  // row stride of the local full-width [M,N] buffer (= N)
+
+    // Experimental chunk-fused SDMA state.
+    void* chunk_dev_comm = nullptr;
+    void* chunk_staging_win = nullptr;
+    void* chunk_recv_win = nullptr;
+    unsigned int* chunk_done = nullptr;
+    unsigned int* chunk_peer_lock = nullptr;
+    int chunk_tiles_per_peer = 0;
+    int chunk_num_m_tiles = 0;
+    int chunk_m_tiles_per_put = 1;
+    unsigned long long chunk_staging_slot_offset = 0;
 };
 
 // Experimental persistent compute + comm pipeline args.
