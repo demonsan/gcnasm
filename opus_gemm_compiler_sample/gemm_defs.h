@@ -56,9 +56,6 @@ struct opus_gemm_traits {
 
     static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16 (b128 ds_read)
     static constexpr int VEC_B = 16 / (int)sizeof(D_B);
-    // C store vec = the WMMA C pack (4 contiguous N elems per lane); the store
-    // layout's issue-space vec is 4, so VEC_C must divide 4.
-    static constexpr int VEC_C = 4;
 
     // LDS prefetch ring depth. The pipeline keeps 2 TDMs in flight and reuses
     // slot g%P three steps later, so P >= 3 keeps g, g+1, g+2 distinct.

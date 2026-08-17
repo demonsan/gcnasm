@@ -69,6 +69,11 @@ is a VALU feeding a ds_read address, which the compiler guards with
 `s_wait_alu depctr_va_vdst(0)` — and that drains the entire in-flight WMMA
 pipe. With the index constant, the multiply folds into the ds_read `offset:`
 immediates, removing both the VALU and most of those waits from the hot loop.
+The step body lives in one `one_step` lambda, but its two slot indices arrive as
+`number<>` and all five call sites pass constants. Letting anything hold them as
+a value — an ordinary `int` parameter, or a `static_for` over the slots — turns
+them back into registers, and the remainder alone costs 54 extra `va_vdst(0)`
+drains that way, 8% on a K where the remainder is 2 of 5 steps.
 
 **Remainder dispatched, not looped.** The at most `P - 1` leftover steps are
 spelled out under `if (n_rem >= k)` rather than run in a loop. A loop there
@@ -77,7 +82,7 @@ across it, since a remainder that runs zero times leaves them as the result, so
 the two ranges overlap and only one can hold the tuple. Dispatching keeps each
 accumulator one live range — pinned placement goes from 444 of 640 WMMA to all
 of them, and the copies that reunited the two halves in the epilogue drop from
-607 `v_mov` to 126, at 747 VGPRs instead of 848 and 129 fewer instructions
+607 `v_mov` to 126, at 745 VGPRs instead of 848 and 129 fewer instructions
 overall. It does not move the clock (those copies all ran once, outside the K
 loop); it is what keeps the pinning intact.
 
@@ -94,15 +99,16 @@ scheduler sinking a prefetch down to its consumer in the next tile. The last
 tile carries the barrier handshake, the next slot's front-load and the next
 K step's TDM, all branch-free.
 
-**Grouped epilogue.** The C write-back is scheduled the same way, as
-[VALU][stores] per sub-tile. Left to itself the scheduler pairs each
-`v_cvt_pk_bf16_f32` with the `buffer_store` that consumes it; every store then
-hits the VALU→VMEM operand hazard and is fronted with an
-`s_wait_alu depctr_va_vdst(0)`, so the epilogue drains the VALU pipe 64 times
-and none of the stores clause. With one workgroup per CU there is no second
-workgroup to overlap that with, and it costs ~2 us per workgroup round —
-9% on a 4096² tile, 20% on a 1024² one. The group barriers take
-`s_wait_alu` from 87 to 31 and restore the 9 store clauses.
+**Grouped epilogue.** C goes out through LDS: each N sub-tile's accumulators are
+cast to bf16, rotated across the banks, `ds_store`d into a ring slot that is dead
+once the last load DMA retired, and one TDM per wave writes whole `B_N` rows to
+global — so the ragged tile needs no guard. The write-back is scheduled the same
+way as the K loop, as [VALU][ds_store] per sub-tile: left interleaved, every
+`ds_store` inherits the VALU→LDS operand hazard. What remains is 10
+`depctr_va_vdst(0)` drains, one per store burst, and both ways of buying them
+more distance measured worse — −0.4 to −1.6% fragmenting the bursts, −0.1 to
+−2.1% hoisting the casts. The sub-tiles that are final before the last K step
+ends are staged inside it, under the WMMAs that follow them.
 
 ## Requirements
 
@@ -175,8 +181,8 @@ placement:
 
 | build | asm lines | `s_wait_alu` | `va_vdst(0)` | VGPR | spill |
 |---|--:|--:|--:|--:|--:|
-| `pin` | 6473 | 287 | **23** | 747 | 0 |
-| `nopin` | 6590 | 276 | **162** | 716 | 0 |
+| `pin` | 6463 | 288 | **21** | 745 | 0 |
+| `nopin` | 6569 | 276 | **160** | 714 | 0 |
 
 `va_vdst(0)` is the number that matters: it drains the whole in-flight VALU pipe
 before the dependent instruction, at a floor of ~24 cycles every time one is
@@ -189,7 +195,7 @@ Pinning removes 139 of them and pays 31 VGPRs, which cost no occupancy — the
 | build | dst in v256–511 | src0 in v512–767 | distinct src0 starts |
 |---|--:|--:|--:|
 | `pin` | 768 / 768 | 768 / 768 | 16 |
-| `nopin` | 0 / 768 | 112 / 768 | 54 |
+| `nopin` | 0 / 768 | 112 / 768 | 51 |
 
 Every WMMA lands on the tuple it asked for: 32 accumulator slices at v256–v504,
 16 B sub-tiles at v512–v632. Without the request the accumulators go to v0–v248
