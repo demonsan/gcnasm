@@ -15,19 +15,104 @@
 #include <string>
 #include <vector>
 
+#ifdef LG_USE_MPI
 #include <mpi.h>
+#else
+#include <chrono>
+#include <fstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <thread>
+#include <unistd.h>
+#endif
 #include "mori/cco/cco.hpp"
 
 #include "lg_comm_abi_v2.h"
 
 using namespace mori::cco;
 
+// ======================= process-group layer =======================
+// Default (no MPI): 4 processes started with `--rank r --world 4 --uid-file <path>` (see run_4rank.sh). Rank 0 creates the CCO unique id and publishes it ATOMICALLY (write temp, rename) to the uid file; the other ranks
+// poll for it with a bounded timeout. Once the communicator exists, barriers use CCO's own host barrier (ccoBarrierAll). The few small reductions (poison flag, validation counts, timings) are exchanged through
+// atomic per-rank files in `<uid-file>.d/` (write temp, rename; bounded polls). With -DLG_USE_MPI (make USE_MPI=1) the same calls map to MPI. A failing rank exits; its peers then time out in their bounded polls.
+static int g_rank_arg = -1, g_world_arg = 4, g_dev_arg = -1, g_sync_timeout_s = 120;
+static std::string g_uid_file;
+static mori::cco::ccoComm* g_comm = nullptr;
+static void dist_set_comm(mori::cco::ccoComm* c) { g_comm = c; }
+#ifdef LG_USE_MPI
+static void dist_init(int& argc, char**& argv, int* rank, int* nranks) { MPI_Init(&argc, &argv); MPI_Comm_rank(MPI_COMM_WORLD, rank); MPI_Comm_size(MPI_COMM_WORLD, nranks); }
+[[noreturn]] static void dist_abort(int code) { MPI_Abort(MPI_COMM_WORLD, code); std::exit(code); }
+static void dist_finalize() { dist_finalize(); }
+static void dist_barrier() { dist_barrier(); }
+static void dist_bcast_uid(mori::cco::ccoUniqueId* uid, int) { MPI_Bcast(uid, sizeof(*uid), MPI_BYTE, 0, MPI_COMM_WORLD); }
+static uint32_t dist_max_u32(uint32_t v) { uint32_t o = 0; MPI_Allreduce(&v, &o, 1, MPI_UINT32_T, MPI_MAX, MPI_COMM_WORLD); return o; }
+static void dist_sum_u64(const uint64_t* in, uint64_t* out, int n) { MPI_Allreduce(in, out, n, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD); }
+static double dist_reduce_d(double v, bool is_max) { double o = 0; MPI_Allreduce(&v, &o, 1, MPI_DOUBLE, is_max ? MPI_MAX : MPI_SUM, MPI_COMM_WORLD); return o; }
+#else
+static std::string sync_dir() { return g_uid_file + ".d"; }
+[[noreturn]] static void dist_abort(int code) { fflush(stdout); fflush(stderr); std::_Exit(code); }
+static bool wait_file(const std::string& path, std::vector<char>* out) {      // bounded poll for a file that appears via atomic rename
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        std::ifstream f(path, std::ios::binary);
+        if (f) { out->assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); return true; }
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > g_sync_timeout_s) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+static void write_atomic(const std::string& path, const void* data, size_t n) {
+    const std::string tmp = path + ".tmp" + std::to_string(::getpid());
+    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f.write(static_cast<const char*>(data), static_cast<std::streamsize>(n)); if (!f) { fprintf(stderr, "cannot write %s\n", tmp.c_str()); dist_abort(7); } }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { fprintf(stderr, "cannot rename %s -> %s\n", tmp.c_str(), path.c_str()); dist_abort(7); }
+}
+static void dist_init(int& argc, char**& argv, int* rank, int* nranks) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--rank" && i + 1 < argc) g_rank_arg = std::atoi(argv[++i]);
+        else if (a == "--world" && i + 1 < argc) g_world_arg = std::atoi(argv[++i]);
+        else if (a == "--uid-file" && i + 1 < argc) g_uid_file = argv[++i];
+        else if (a == "--device" && i + 1 < argc) g_dev_arg = std::atoi(argv[++i]);
+        else if (a == "--sync-timeout-s" && i + 1 < argc) g_sync_timeout_s = std::atoi(argv[++i]);
+    }
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "-h" || std::string(argv[i]) == "--help") { *rank = (g_rank_arg < 0 ? 0 : g_rank_arg); *nranks = g_world_arg; return; }
+    if (g_rank_arg < 0 || g_world_arg != 4 || g_rank_arg >= g_world_arg || g_uid_file.empty()) {
+        fprintf(stderr, "non-MPI mode needs --rank <0..3> --world 4 --uid-file <path> (use run_4rank.sh, or build with `make USE_MPI=1` and use mpirun)\n");
+        std::_Exit(2);
+    }
+    *rank = g_rank_arg; *nranks = g_world_arg;
+    ::mkdir(sync_dir().c_str(), 0777);
+}
+static void dist_finalize() {}
+static void dist_bcast_uid(mori::cco::ccoUniqueId* uid, int rank) {
+    if (rank == 0) write_atomic(g_uid_file, uid, sizeof(*uid));                 // atomic publish: readers see the whole id or no file
+    else {
+        std::vector<char> b;
+        if (!wait_file(g_uid_file, &b) || b.size() != sizeof(*uid)) { fprintf(stderr, "rank %d: uid file %s did not appear (or has the wrong size) within %d s\n", rank, g_uid_file.c_str(), g_sync_timeout_s); dist_abort(7); }
+        std::memcpy(uid, b.data(), sizeof(*uid));
+    }
+}
+static void dist_barrier() {                                                      // CCO host barrier (needs the communicator; every call site is after ccoCommCreate)
+    if (!g_comm) { fprintf(stderr, "dist_barrier before communicator creation\n"); dist_abort(7); }
+    if (mori::cco::ccoBarrierAll(g_comm) != 0) { fprintf(stderr, "ccoBarrierAll failed\n"); dist_abort(7); }
+}
+static void dist_gather(int rank, const void* in, size_t n, std::vector<std::vector<char>>* all) {   // tiny allgather through per-rank files, sequence-numbered, bounded
+    static int seq = 0; ++seq;
+    const std::string base = sync_dir() + "/g" + std::to_string(seq) + ".r";
+    write_atomic(base + std::to_string(rank), in, n);
+    all->assign(4, {});
+    for (int r = 0; r < 4; ++r) if (!wait_file(base + std::to_string(r), &(*all)[r])) { fprintf(stderr, "rank %d: peer %d did not report (gather %d) within %d s\n", rank, r, seq, g_sync_timeout_s); dist_abort(7); }
+}
+static int g_my_rank = 0;
+static uint32_t dist_max_u32(uint32_t v) { std::vector<std::vector<char>> a; dist_gather(g_my_rank, &v, 4, &a); uint32_t m = 0; for (auto& x : a) { uint32_t u; std::memcpy(&u, x.data(), 4); m = std::max(m, u); } return m; }
+static void dist_sum_u64(const uint64_t* in, uint64_t* out, int n) { std::vector<std::vector<char>> a; dist_gather(g_my_rank, in, 8 * n, &a); for (int i = 0; i < n; ++i) { out[i] = 0; for (auto& x : a) { uint64_t u; std::memcpy(&u, x.data() + 8 * i, 8); out[i] += u; } } }
+static double dist_reduce_d(double v, bool is_max) { std::vector<std::vector<char>> a; dist_gather(g_my_rank, &v, 8, &a); double o = is_max ? -1e300 : 0.0; for (auto& x : a) { double u; std::memcpy(&u, x.data(), 8); o = is_max ? std::max(o, u) : o + u; } return o; }
+#endif
 #define CHECK_HIP(call)                                                                                 \
     do {                                                                                                \
         hipError_t status_ = (call);                                                                    \
         if (status_ != hipSuccess) {                                                                    \
             fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__, hipGetErrorString(status_)); \
-            MPI_Abort(MPI_COMM_WORLD, 1);                                                               \
+            dist_abort(1);                                                               \
         }                                                                                               \
     } while (0)
 #define CHECK_CCO(call)                                                                                              \
@@ -35,7 +120,7 @@ using namespace mori::cco;
         int cco_status_ = (call);                                                                                    \
         if (cco_status_ != 0) {                                                                                      \
             fprintf(stderr, "cco error %d (%s:%d): %s\n", cco_status_, __FILE__, __LINE__, #call);                   \
-            MPI_Abort(MPI_COMM_WORLD, 1);                                                                            \
+            dist_abort(1);                                                                            \
         }                                                                                                            \
     } while (0)
 
@@ -99,7 +184,9 @@ uint32_t default_puts_per_peer(uint32_t M) { return M <= 2048u ? 1u : (M <= 4096
 void usage(int rank) {
     if (rank != 0) return;
     fprintf(stderr,
-        "usage: mpirun -n 4 fp8_a2a_sdma_<build>.exe [options]\n"
+        "usage: ./run_4rank.sh build_<plan>/fp8_a2a_sdma_<plan>.exe [options]   (default, no MPI)\n"
+        "       mpirun -n 4 fp8_a2a_sdma_<plan>.exe [options]                      (built with `make USE_MPI=1`)\n"
+        "  --rank r --world 4 --uid-file <path> [--device d] [--sync-timeout-s 120]   non-MPI launch (run_4rank.sh sets them)\n"
         "  --case dense|indexer|reuse   plan (must match the build: indexer needs the LG_X_INDEXER=1 build, dense/reuse the LG_X_INDEXER=0 build). default: dense\n"
         "  --M <rows per rank>          M = T/4, multiple of 256, <= 8192 (T = 4M: 8192/16384/32768 -> M 2048/4096/8192). default 2048\n"
         "  --puts-per-peer 1|2|4        SDMA puts (put groups) per peer per epoch; 0 = default by M (1/2/4). default 0\n"
@@ -112,10 +199,11 @@ void usage(int rank) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
     int rank = 0, nranks = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+    dist_init(argc, argv, &rank, &nranks);
+#ifndef LG_USE_MPI
+    g_my_rank = rank;
+#endif
 
     Case cs = Case::Dense;
     uint32_t M = 2048, puts = 0, warmup = 5, iters = 50, check_rows = 16;
@@ -123,11 +211,11 @@ int main(int argc, char** argv) {
     bool half_first = false, exact = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        auto next = [&](const char* name) -> const char* { if (i + 1 >= argc) { if (rank == 0) fprintf(stderr, "%s needs a value\n", name); usage(rank); MPI_Abort(MPI_COMM_WORLD, 2); } return argv[++i]; };
+        auto next = [&](const char* name) -> const char* { if (i + 1 >= argc) { if (rank == 0) fprintf(stderr, "%s needs a value\n", name); usage(rank); dist_abort(2); } return argv[++i]; };
         if (a == "--case" || a == "-c") {
             const std::string v = next("--case");
             if (v == "dense") cs = Case::Dense; else if (v == "indexer") cs = Case::Indexer; else if (v == "reuse") cs = Case::Reuse;
-            else { if (rank == 0) fprintf(stderr, "--case must be dense, indexer or reuse\n"); MPI_Abort(MPI_COMM_WORLD, 2); }
+            else { if (rank == 0) fprintf(stderr, "--case must be dense, indexer or reuse\n"); dist_abort(2); }
         } else if (a == "--M" || a == "-M") M = static_cast<uint32_t>(std::atoi(next("--M")));
         else if (a == "--puts-per-peer") puts = static_cast<uint32_t>(std::atoi(next("--puts-per-peer")));
         else if (a == "--half-first") half_first = true;
@@ -136,37 +224,39 @@ int main(int argc, char** argv) {
         else if (a == "--check-rows") check_rows = static_cast<uint32_t>(std::atoi(next("--check-rows")));
         else if (a == "--poll-budget-us") budget_us = static_cast<uint64_t>(std::atoll(next("--poll-budget-us")));
         else if (a == "--exact") exact = true;
-        else if (a == "-h" || a == "--help") { usage(rank); MPI_Finalize(); return 0; }
-        else { if (rank == 0) fprintf(stderr, "unknown option %s\n", a.c_str()); usage(rank); MPI_Abort(MPI_COMM_WORLD, 2); }
+        else if (a == "--rank" || a == "--world" || a == "--uid-file" || a == "--device" || a == "--sync-timeout-s") { (void)next(a.c_str()); }   // consumed by dist_init (non-MPI mode); ignored under mpirun
+        else if (a == "-h" || a == "--help") { usage(rank); dist_finalize(); return 0; }
+        else { if (rank == 0) fprintf(stderr, "unknown option %s\n", a.c_str()); usage(rank); dist_abort(2); }
     }
-    if (nranks != kNumRanks) { if (rank == 0) fprintf(stderr, "this program needs exactly 4 ranks (got %d)\n", nranks); MPI_Abort(MPI_COMM_WORLD, 2); }
-    if (M == 0 || M % 256 != 0 || M > 8192) { if (rank == 0) fprintf(stderr, "--M must be a multiple of 256 and <= 8192\n"); MPI_Abort(MPI_COMM_WORLD, 2); }
+    if (nranks != kNumRanks) { if (rank == 0) fprintf(stderr, "this program needs exactly 4 ranks (got %d)\n", nranks); dist_abort(2); }
+    if (M == 0 || M % 256 != 0 || M > 8192) { if (rank == 0) fprintf(stderr, "--M must be a multiple of 256 and <= 8192\n"); dist_abort(2); }
     const bool build_indexer = (LG_X_INDEXER != 0);
     if ((cs == Case::Indexer) != build_indexer) {
         if (rank == 0) fprintf(stderr, "case/build mismatch: --case %s needs the %s build (this binary: LG_X_INDEXER=%d, F=%u). Rebuild with `make PLAN=%s`.\n",
                                case_name(cs), cs == Case::Indexer ? "indexer" : "dense", static_cast<int>(LG_X_INDEXER), kF, cs == Case::Indexer ? "indexer" : "dense");
-        MPI_Abort(MPI_COMM_WORLD, 2);
+        dist_abort(2);
     }
     const uint32_t npp = puts ? puts : default_puts_per_peer(M);
     const uint32_t chunks = M / LG_CHUNK_ROWS;
-    if (npp != 1u && npp != 2u && npp != 4u) { if (rank == 0) fprintf(stderr, "--puts-per-peer must be 1, 2 or 4\n"); MPI_Abort(MPI_COMM_WORLD, 2); }
-    if (half_first && npp == 1u) { if (rank == 0) fprintf(stderr, "--half-first needs --puts-per-peer 2 or 4\n"); MPI_Abort(MPI_COMM_WORLD, 2); }
-    if (chunks % npp != 0u) { if (rank == 0) fprintf(stderr, "chunks (M/256 = %u) must be divisible by --puts-per-peer %u\n", chunks, npp); MPI_Abort(MPI_COMM_WORLD, 2); }
+    if (npp != 1u && npp != 2u && npp != 4u) { if (rank == 0) fprintf(stderr, "--puts-per-peer must be 1, 2 or 4\n"); dist_abort(2); }
+    if (half_first && npp == 1u) { if (rank == 0) fprintf(stderr, "--half-first needs --puts-per-peer 2 or 4\n"); dist_abort(2); }
+    if (chunks % npp != 0u) { if (rank == 0) fprintf(stderr, "chunks (M/256 = %u) must be divisible by --puts-per-peer %u\n", chunks, npp); dist_abort(2); }
 
     int ndev = 0;
     CHECK_HIP(hipGetDeviceCount(&ndev));
-    CHECK_HIP(hipSetDevice(rank % ndev));                      // the kernels require rank == lsaRank == HIP device id: run on GPUs 0..3 of one node (use HIP_VISIBLE_DEVICES to pick the 4 GPUs)
+    CHECK_HIP(hipSetDevice(g_dev_arg >= 0 ? g_dev_arg : rank % ndev));      // non-MPI default: device index = rank among the VISIBLE devices (all 4 GPUs must be visible to every process: CCO maps peer memory)                      // the kernels require rank == lsaRank == HIP device id: run on GPUs 0..3 of one node (use HIP_VISIBLE_DEVICES to pick the 4 GPUs)
 
     // ---------------- communicator + three equal-size windows (S staging, R receive, C control) ----------------
     ccoUniqueId uid;
     if (rank == 0) CHECK_CCO(ccoGetUniqueId(&uid));
-    MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+    dist_bcast_uid(&uid, rank);
     ccoComm* comm = nullptr;
     constexpr size_t kPerRankVmm = 4ull << 30;                 // 4 GiB per-rank VMM slot (CCO aligns it to 4 GiB)
     CHECK_CCO(ccoCommCreate(uid, nranks, rank, kPerRankVmm, &comm));
+    dist_set_comm(comm);
     if (comm->worldSize != 4 || comm->lsaSize != 4 || static_cast<uint32_t>(comm->lsaRank) != static_cast<uint32_t>(rank)) {
         fprintf(stderr, "rank %d: topology guard failed (world %d lsa %d lsaRank %d): need 4 ranks on ONE node with rank == lsaRank\n", rank, comm->worldSize, comm->lsaSize, comm->lsaRank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
+        dist_abort(1);
     }
     // Window sizing (r8g): S, R and C get the SAME size = roundup(max(P + pad, control/stamp area), G), G = max(comm granularity, 4 MiB). The VMM allocator failed with hipMemSetAccess "invalid argument" for a
     // window whose size is not a multiple of 4 MiB (the reported 4096-B granule is queried without gpuDirectRDMACapable, which ccoMemAlloc sets); every size that worked is a multiple of 4 MiB.
@@ -187,7 +277,7 @@ int main(int argc, char** argv) {
     reqs.sdmaQueueCount = 1;                                   // one SDMA queue per peer (more queues were slower in the sdma bench)
     ccoDevComm dev{};
     CHECK_CCO(ccoDevCommCreate(comm, &reqs, &dev));
-    if (dev.sdma.sdmaNumQueue != 1) { fprintf(stderr, "rank %d: sdmaNumQueue %d != 1\n", rank, static_cast<int>(dev.sdma.sdmaNumQueue)); MPI_Abort(MPI_COMM_WORLD, 1); }
+    if (dev.sdma.sdmaNumQueue != 1) { fprintf(stderr, "rank %d: sdmaNumQueue %d != 1\n", rank, static_cast<int>(dev.sdma.sdmaNumQueue)); dist_abort(1); }
 
     // ---------------- deterministic per-rank inputs ----------------
     const size_t a_bytes = static_cast<size_t>(M) * kK, w_bytes = static_cast<size_t>(kN) * kK;
@@ -220,7 +310,7 @@ int main(int argc, char** argv) {
     init_control();
     CHECK_HIP(hipMemset(Rva, 0xFF, Ws));                       // sentinel: an unwritten R element can never pass the check (0xFFFF is a BF16 NaN)
     CHECK_HIP(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);                               // all windows/control initialised before any rank PUTs or releases credit
+    dist_barrier();                               // all windows/control initialised before any rank PUTs or releases credit
 
     // ---------------- launch plumbing ----------------
     LgCommArgsV2 args; std::memset(&args, 0, sizeof args);
@@ -255,15 +345,14 @@ int main(int argc, char** argv) {
         d.dev = dev; d.Swin = S; d.Rwin = R; d.Cwin = C; d.rank = static_cast<uint32_t>(rank); d.sdma_queues = 1; d.abi_version = LG_COMM_ABI_VERSION;
         hipLaunchKernelGGL(lg_drain_all_v2, dim3(1), dim3(64), 0, stream, d);
         CHECK_HIP(hipStreamSynchronize(stream));
-        MPI_Barrier(MPI_COMM_WORLD);
+        dist_barrier();
         init_control();
-        MPI_Barrier(MPI_COMM_WORLD);
+        dist_barrier();
     };
     auto check_poison_all = [&](const char* where) -> bool {
         uint64_t ep, done; uint32_t poison;
         read_report(&ep, &poison, &done);
-        uint32_t any = 0, mine = poison;
-        MPI_Allreduce(&mine, &any, 1, MPI_UINT32_T, MPI_MAX, MPI_COMM_WORLD);
+        const uint32_t any = dist_max_u32(poison);
         if (poison) fprintf(stderr, "rank %d: POISON %u at %s (ep=%llu epochs_done=%llu)\n", rank, poison, where, static_cast<unsigned long long>(ep), static_cast<unsigned long long>(done));
         return any != 0;
     };
@@ -271,7 +360,7 @@ int main(int argc, char** argv) {
     // ---------------- one validated epoch ----------------
     launch_epoch();
     CHECK_HIP(hipStreamSynchronize(stream));
-    if (check_poison_all("validation epoch")) { recover(); if (rank == 0) fprintf(stderr, "FAILED: poisoned validation epoch (control window re-initialised; see per-rank POISON lines)\n"); MPI_Abort(MPI_COMM_WORLD, 3); }
+    if (check_poison_all("validation epoch")) { recover(); if (rank == 0) fprintf(stderr, "FAILED: poisoned validation epoch (control window re-initialised; see per-rank POISON lines)\n"); dist_abort(3); }
 
     // Validate R: for every source rank s and a sample of rows, ALL kF packed columns of the slab this rank received. Reference = FP64 accumulate over the dequantised inputs, then (acc*Ws)*As in FP32 and ONE BF16 RNE.
     // (exact inputs: the dot product is exact, expect byte-equality; random inputs: tolerance rtol=atol=0.02, the golden compare_outputs rule). The reuse case reads the compact [4M,2304] R in the strided [T,2560] view layout of the golden receiver: row stride 2304.
@@ -309,27 +398,26 @@ int main(int argc, char** argv) {
         }
     }
     uint64_t tot[3] = {checked, bad, byte_diff}, all[3] = {0, 0, 0};
-    MPI_Allreduce(tot, all, 3, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
-    double gmax = 0.0; MPI_Allreduce(&max_abs, &gmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    dist_sum_u64(tot, all, 3);
+    const double gmax = dist_reduce_d(max_abs, true);
     const bool valid = (all[1] == 0) && (!exact || all[2] == 0);
     if (rank == 0) printf("validate [%s, %s inputs]: %llu elements checked over %u rows/source x %d sources; tolerance failures %llu; bytes differing from the reference %llu; max |diff| %.4g -> %s\n",
                           case_name(cs), exact ? "exact" : "random", static_cast<unsigned long long>(all[0]), rows_per_src, kNumRanks, static_cast<unsigned long long>(all[1]), static_cast<unsigned long long>(all[2]), gmax, valid ? "PASS" : "FAIL");
-    if (!valid) MPI_Abort(MPI_COMM_WORLD, 4);
+    if (!valid) dist_abort(4);
 
     // ---------------- timing: hipEvents around `iters` back-to-back epochs (GEMM + SDMA chain, one stream) ----------------
     hipEvent_t e0, e1; CHECK_HIP(hipEventCreate(&e0)); CHECK_HIP(hipEventCreate(&e1));
     for (uint32_t i = 0; i < warmup; ++i) launch_epoch();
     CHECK_HIP(hipStreamSynchronize(stream));
-    MPI_Barrier(MPI_COMM_WORLD);
+    dist_barrier();
     CHECK_HIP(hipEventRecord(e0, stream));
     for (uint32_t i = 0; i < iters; ++i) launch_epoch();
     CHECK_HIP(hipEventRecord(e1, stream));
     CHECK_HIP(hipEventSynchronize(e1));
     float ms = 0.f; CHECK_HIP(hipEventElapsedTime(&ms, e0, e1));
     const double us_epoch = 1000.0 * ms / std::max<uint32_t>(iters, 1);
-    double us_max = 0.0, us_sum = 0.0;
-    MPI_Allreduce(&us_epoch, &us_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Allreduce(&us_epoch, &us_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    const double us_max = dist_reduce_d(us_epoch, true), us_sum = dist_reduce_d(us_epoch, false);
+    if (rank != 0) printf("rank %d: epoch %.1f us\n", rank, us_epoch);
     const double out_bytes = 3.0 * M * kF * 2.0;               // bytes each rank PUTs per epoch (3 remote slabs of M x F BF16)
     const bool poisoned = check_poison_all("timing");
     uint64_t ep, done; uint32_t poison; read_report(&ep, &poison, &done);
@@ -343,9 +431,9 @@ int main(int argc, char** argv) {
     (void)dev; (void)kDenseN;
     CHECK_HIP(hipEventDestroy(e0)); CHECK_HIP(hipEventDestroy(e1)); CHECK_HIP(hipStreamDestroy(stream));
     CHECK_HIP(hipFree(dA)); CHECK_HIP(hipFree(dW)); CHECK_HIP(hipFree(dAs)); CHECK_HIP(hipFree(dWs));
-    MPI_Barrier(MPI_COMM_WORLD);
+    dist_barrier();
     CHECK_CCO(ccoWindowDeregister(comm, C)); CHECK_CCO(ccoWindowDeregister(comm, R)); CHECK_CCO(ccoWindowDeregister(comm, S));
     CHECK_CCO(ccoCommDestroy(comm));
-    MPI_Finalize();
+    dist_finalize();
     return poisoned ? 5 : 0;
 }

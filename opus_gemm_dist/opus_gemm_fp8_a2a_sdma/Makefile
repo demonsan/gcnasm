@@ -20,10 +20,22 @@ else
 $(error PLAN must be dense or indexer)
 endif
 
+# Launch mode. Default (USE_MPI=0): no MPI; 4 processes started by run_4rank.sh with --rank/--world/--uid-file (uid file + CCO host barrier + small file-based reductions).
+# USE_MPI=1 builds the mpirun variant (needs mpi.h / libmpi / mpirun).
+USE_MPI         ?= 0
 MPI_INCLUDE_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi/include
 MPI_LIB         ?= -lmpi_cxx -lmpi
+ifeq ($(USE_MPI),1)
+MPI_DEFS      := -DLG_USE_MPI=1
+MPI_INCLUDES  := -I$(MPI_INCLUDE_DIR)
+MPI_LINK      := $(MPI_LIB)
+else
+MPI_DEFS      :=
+MPI_INCLUDES  :=
+MPI_LINK      :=
+endif
 
-BUILD = build_$(PLAN)
+BUILD = build_$(PLAN)$(if $(filter 1,$(USE_MPI)),_mpi,)
 OUT   = $(BUILD)/fp8_a2a_sdma_$(PLAN).exe
 
 # Flags shared by every object. -fno-fast-math is REQUIRED: the epilogue is bf16_rne(fp32(fp32(acc*Wscale)*Ascale)) (two separate multiplies, one rounding), and the
@@ -31,8 +43,8 @@ OUT   = $(BUILD)/fp8_a2a_sdma_$(PLAN).exe
 LG_FLAGS     = -DBUILD_CCO_SDMA=1 -DLG_X_INDEXER=$(INDEXER) -DLG_R8_FOLD=$(FOLD) -DLG_REMOTE_HALF=0 -DLG_R6_POSTER=1 -DLG_R6_ARRIVAL_ACQ=0 \
                -DLG_L2B_ONE_RELEASE=1 -DLG_L2A_BYPASS=0 -DLG_L1C_SWIZZLE=0 -DLG_DEBUG_POSTCOUNT=$(DEBUG_POSTCOUNT) -DLG_STAMPS=$(STAMPS)
 COMMON_FLAGS = -I. -I$(abspath $(OPUS_INCLUDE_DIR)) -std=c++20 -fopenmp -O3 -Wall -fno-fast-math --offload-arch=$(ARCH) -DOPUS_TILE_CONTAINER=0 $(LG_FLAGS)
-HOST_INCLUDES = -I$(MORI_INCLUDE_DIR) -I$(MPI_INCLUDE_DIR)
-HOST_LIBS = -L$(MORI_LIB_DIR) -lmori_cco -Wl,-rpath,$(MORI_LIB_DIR) $(MPI_LIB)
+HOST_INCLUDES = -I$(MORI_INCLUDE_DIR) $(MPI_INCLUDES)
+HOST_LIBS = -L$(MORI_LIB_DIR) -lmori_cco -Wl,-rpath,$(MORI_LIB_DIR) $(MPI_LINK)
 
 HDRS = lg_comm_abi_v2.h lg_comm_device.hpp lg_r6x.hpp epilogue_ptpc_pairstore.hpp layout/quad_fp8_fieldmap.hpp layout/quad_fp8_layouts.hpp layout/quad_fp8_traits.hpp
 OBJS = $(BUILD)/gemm_fp8_a2a_sdma_kernel.o $(BUILD)/main.o
@@ -42,10 +54,10 @@ OBJS = $(BUILD)/gemm_fp8_a2a_sdma_kernel.o $(BUILD)/main.o
 all: $(OUT)
 
 dense:
-	$(MAKE) PLAN=dense
+	$(MAKE) PLAN=dense USE_MPI=$(USE_MPI)
 
 indexer:
-	$(MAKE) PLAN=indexer
+	$(MAKE) PLAN=indexer USE_MPI=$(USE_MPI)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -56,14 +68,18 @@ $(BUILD)/gemm_fp8_a2a_sdma_kernel.o: gemm_fp8_a2a_sdma_kernel.cc $(HDRS) | $(BUI
 	$(HIPCC) $< $(COMMON_FLAGS) $(HOST_INCLUDES) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj -c -o $@
 
 $(BUILD)/main.o: main.cc lg_comm_abi_v2.h | $(BUILD)
-	$(HIPCC) $< $(COMMON_FLAGS) $(HOST_INCLUDES) -c -o $@
+	$(HIPCC) $< $(COMMON_FLAGS) $(MPI_DEFS) $(HOST_INCLUDES) -c -o $@
 
 $(OUT): $(OBJS)
 	$(HIPCC) $^ --offload-arch=$(ARCH) -fopenmp $(HOST_LIBS) -o $@
 
 # 4 ranks on GPUs 0..3 of one node (rank == lsaRank == HIP device id is required by the kernels).
 run: $(OUT)
+ifeq ($(USE_MPI),1)
 	mpirun --allow-run-as-root -n 4 $(OUT) --case $(if $(filter indexer,$(PLAN)),indexer,dense)
+else
+	./run_4rank.sh $(OUT) --case $(if $(filter indexer,$(PLAN)),indexer,dense)
+endif
 
 clean:
-	rm -rf build_dense build_indexer
+	rm -rf build_dense build_indexer build_dense_mpi build_indexer_mpi

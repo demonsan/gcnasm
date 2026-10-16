@@ -1,6 +1,6 @@
 # opus_gemm_fp8_a2a_sdma
 
-Standalone experiment for an FP8 PTPC GEMM fused with an SDMA all-to-all for the SP4 large-T QKV projection
+Standalone experiment (no MPI needed by default) for an FP8 PTPC GEMM fused with an SDMA all-to-all for the SP4 large-T QKV projection
 (T = 8192 / 16384 / 32768 tokens, 4 ranks, per-rank M = T/4 = 2048 / 4096 / 8192).
 
 Each rank computes `C = A x W^T` for its own `M` tokens over the full QKV weight (`K = 6144`; `N = 9216` dense, `N = 9856` with the
@@ -67,7 +67,7 @@ the results section were measured in the private harness with the unchanged gold
   `fence(acquire)`). Verify in the ISA: `buffer_wbl2 sc0 sc1` -> `s_waitcnt vmcnt(0)` -> atomic.
 - **Poster waits are relaxed spins with one acquire fence** after success (an `ACQUIRE` load per spin would issue a `buffer_inv` per spin on the poster's XCD for the whole GEMM).
 - **Recovery rule (A2-H).** After *any* epoch with a poison on *any* rank (a put-phase failure leaves stale group counters/state), the next epoch must not be launched until:
-  `drain_all` on every rank -> barrier -> `init_control` on every rank (zeroes the whole control window) -> barrier. `main.cc` implements this (`recover()`); a poisoned validation epoch aborts after recovery.
+  `drain_all` on every rank -> barrier -> `init_control` on every rank (zeroes the whole control window) -> barrier. `main.cc` implements this (`recover()`, using the CCO host barrier or MPI); a poisoned validation epoch aborts after recovery.
 - **Bounded waits only.** Every remote wait has a budget in microseconds (`--poll-budget-us`, default 50 ms, must exceed worst-case GEMM time + rank skew); a timeout poisons the epoch instead of hanging.
 - The kernels require **rank == lsaRank == HIP device id**, 4 ranks on one node (GPUs 0..3 or `HIP_VISIBLE_DEVICES`), and `BUILD_CCO_SDMA=1` (the MORI header default `0` turns PUTs into silent no-ops).
 
@@ -81,23 +81,42 @@ make PLAN=dense   OPUS_INCLUDE_DIR=<path to aiter/csrc/include> MORI_INCLUDE_DIR
 make PLAN=indexer OPUS_INCLUDE_DIR=<path to aiter/csrc/include> MORI_INCLUDE_DIR=<mori>/include MORI_LIB_DIR=<mori>/build/src/cco
 ```
 
+By default the host is built **without MPI** (`USE_MPI=0`): 4 processes are started by `run_4rank.sh`. `make ... USE_MPI=1` builds the `mpirun` variant instead (needs `mpi.h`, `libmpi`, `mpirun`; output in `build_<plan>_mpi/`).
+
 `OPUS_INCLUDE_DIR` must point at an aiter checkout's `csrc/include` containing `opus/opus.hpp` and `opus/hip_minimal.hpp` (the private Opus headers; the kernel TU is built with `-D__HIPCC_RTC__`,
 its host pass defines empty `__global__` stubs). Builds go to `build_dense/` and `build_indexer/`; `-Rpass-analysis=kernel-resource-usage` prints VGPR/spill/LDS (expect no spill, no scratch, LDS 135168 B).
 Production flags are fixed by the Makefile (`FOLD=0`, L2b release, full remote tiles, no debug seams); `FOLD=1`, `DEBUG_POSTCOUNT=1`, `STAMPS=1` are available for experiments and are never used for timing.
 
 ## Run
 
+### Default: no MPI (`run_4rank.sh`)
+
 ```bash
-# 4 ranks, GPUs 0..3 of one node
-mpirun --allow-run-as-root -n 4 build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 2048 --puts-per-peer 2 --half-first   # T=8192 (half-first needs n = 2 or 4)
-mpirun --allow-run-as-root -n 4 build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 4096 --puts-per-peer 2 --warmup 5 --iters 50
-mpirun --allow-run-as-root -n 4 build_dense/fp8_a2a_sdma_dense.exe   --case reuse   --M 8192 --puts-per-peer 4
-mpirun --allow-run-as-root -n 4 build_indexer/fp8_a2a_sdma_indexer.exe --case indexer --M 2048 --puts-per-peer 2 --half-first
+# 4 ranks on GPUs 0..3 of one node (DEVICES=0,1,2,3 is the default; pick other GPUs with DEVICES=4,5,6,7)
+./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 2048 --puts-per-peer 2 --half-first   # T=8192 (half-first needs n = 2 or 4)
+./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 4096 --puts-per-peer 2 --warmup 5 --iters 50
+./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case reuse   --M 8192 --puts-per-peer 4
+./run_4rank.sh build_indexer/fp8_a2a_sdma_indexer.exe --case indexer --M 2048 --puts-per-peer 2 --half-first
 # byte-exact validation with exact-arithmetic inputs
-mpirun --allow-run-as-root -n 4 build_dense/fp8_a2a_sdma_dense.exe --case dense --M 2048 --exact
+./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe --case dense --M 2048 --exact
 ```
 
-`--M` is the per-rank row count (`M = T/4`). The program creates the CCO communicator and the three windows, builds deterministic per-rank inputs, runs one validated epoch, then
+`run_4rank.sh` starts the 4 processes (`--rank r --world 4 --uid-file <workdir>/cco.uid --device r`), exports `HIP_VISIBLE_DEVICES=$DEVICES` to **every** rank (each process must see all 4 GPUs because CCO maps peer
+memory; rank `r` uses visible device `r`), waits for them, and prints the 4 per-rank logs. Rank 0 creates the CCO unique id and publishes it atomically (write + rename) to the uid file; the other ranks poll
+for it with a bounded timeout (`TIMEOUT_S`, default 120 s). After the communicator exists, barriers use CCO's host barrier (`ccoBarrierAll`); the few small reductions (poison flag, validation counts, timings) are exchanged through
+atomic per-rank files in `<uid-file>.d/`. Every wait is bounded; if a rank fails, the others report which peer did not answer and exit. `WORKDIR` defaults to a fresh `mktemp -d` (a stale uid file would be misread, so reuse
+a directory only after deleting it). Rank 0 prints the validation and timing summary; the other ranks print their own epoch time. Manual launch (e.g. under a scheduler): start 4 processes with
+`HIP_VISIBLE_DEVICES=0,1,2,3 exe --rank r --world 4 --uid-file /shared/path/cco.uid --device r ...`.
+
+### With MPI (`make USE_MPI=1`)
+
+```bash
+make PLAN=dense USE_MPI=1 OPUS_INCLUDE_DIR=... MORI_INCLUDE_DIR=... MORI_LIB_DIR=...
+mpirun --allow-run-as-root -n 4 build_dense_mpi/fp8_a2a_sdma_dense.exe --case dense --M 2048 --puts-per-peer 2 --half-first
+```
+
+Identical options and output; `--rank/--world/--uid-file` are ignored (MPI provides them) and the barriers/reductions are MPI collectives.
+`--M` is the per-rank row count (`M = T/4`). The program (either launch mode) creates the CCO communicator and the three windows, builds deterministic per-rank inputs, runs one validated epoch, then
 times `--iters` back-to-back epochs with hipEvents and prints microseconds per epoch and per-rank / aggregate PUT GB/s.
 
 **Validation.** For every source rank and `--check-rows` sampled rows, all `F` packed columns of the slab this rank received are compared with a host reference
@@ -132,4 +151,4 @@ Standalone timings of this program (GEMM + SDMA chain only, no receiver) will be
 
 Ported without algorithm changes from the private playground candidate LG-QSDMA-r8 at r8g (manifest `a6e3988b19be3b0d59c38eaf2a984fa9a7e22ec821cf1e2b886868fc78859892`), production configuration `FOLD=0`:
 `gemm_fp8_a2a_sdma_kernel.cc` is `device/gemm_quad_fp8_comm.cu`; `lg_comm_device.hpp`, `lg_r6x.hpp`, `epilogue_ptpc_pairstore.hpp`, `layout/*`, `lg_comm_abi_v2.h` are copied unchanged. The Python bridge and the
-ctypes driver are replaced by `main.cc`.
+ctypes driver are replaced by `main.cc` (default non-MPI process group; MPI behind `USE_MPI=1`).
