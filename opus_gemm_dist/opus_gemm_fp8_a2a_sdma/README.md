@@ -145,7 +145,22 @@ Source: the private project ledger (confirmations by an independent evidence rol
 | reuse (q/k/v only) | 1.2191 / 1.2189 (n2h) | 1.3363 (n4); 1.3884 in a later window (n2) | 1.3372 (n4); 1.4816 in a later window (n4) |
 
 Two numbers in a cell are two independent windows (ledger r115 dense, r123 indexer T8192, r128/r129 reuse T8192); a single number is the confirming window of r118; "later window" values are the r128 first-window F0 results quoted in the ledger. Dense T = 8192 is the only large-T cell below 1.20 (best 1.148, ledger r129); small M (T = 64 / 128) is not part of this directory.
-Standalone timings of this program (GEMM + SDMA chain only, no receiver) will be added after the program is run on the GPU node.
+### Standalone results of this program
+
+GEMM + SDMA chain only (no receiver), MI355X gfx950, 4 ranks on GPUs 4–7, default non-MPI launch (`run_4rank.sh`), eager launches timed with hipEvents, `--warmup 10 --iters 101`, one repeat; reported value is µs per epoch, max over ranks. Validation samples 16 rows per source rank × all packed columns × 4 destinations: `--exact` inputs are byte-equal to the host reference, random inputs pass `rtol = atol = 0.02`, and the poison word is 0 on all ranks.
+
+| case | M (rows/rank) | plan | exact-input µs | random-input µs |
+|---|---:|---|---:|---:|
+| dense | 2048 | n1 | 273.55 | 274.87 |
+| dense | 2048 | n2h | 254.59 | 257.03 |
+| dense | 4096 | n2 | 441.54 | 440.59 |
+| dense | 8192 | n4 | 763.26 | 763.24 |
+| indexer | 2048 | n2h | 274.50 | 276.31 |
+| indexer | 4096 | n4 | 458.01 | 467.34 |
+| indexer | 8192 | n4 | 884.48 | 884.51 |
+| reuse (compact q/k/v) | 2048 | n2h | 254.27 | 258.92 |
+
+These numbers are not comparable to the full-chain ratios above, which include the receiver and the graph-replay metric.
 
 ## Provenance
 
