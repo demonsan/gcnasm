@@ -254,16 +254,12 @@ int main(int argc, char** argv) {
     constexpr size_t kPerRankVmm = 4ull << 30;                 // 4 GiB per-rank VMM slot (CCO aligns it to 4 GiB)
     CHECK_CCO(ccoCommCreate(uid, nranks, rank, kPerRankVmm, &comm));
     dist_set_comm(comm);
-    if (comm->worldSize != 4 || comm->lsaSize != 4 || static_cast<uint32_t>(comm->lsaRank) != static_cast<uint32_t>(rank)) {
-        fprintf(stderr, "rank %d: topology guard failed (world %d lsa %d lsaRank %d): need 4 ranks on ONE node with rank == lsaRank\n", rank, comm->worldSize, comm->lsaSize, comm->lsaRank);
-        dist_abort(1);
-    }
-    // Window sizing (r8g): S, R and C get the SAME size = roundup(max(P + pad, control/stamp area), G), G = max(comm granularity, 4 MiB). The VMM allocator failed with hipMemSetAccess "invalid argument" for a
+    // Window sizing (r8g): S, R and C get the SAME size = roundup(max(P + pad, control/stamp area), G), G = 4 MiB (raise via env LG_WINDOW_GRAN_MIB). The VMM allocator failed with hipMemSetAccess "invalid argument" for a
     // window whose size is not a multiple of 4 MiB (the reported 4096-B granule is queried without gpuDirectRDMACapable, which ccoMemAlloc sets); every size that worked is a multiple of 4 MiB.
     const uint64_t P = 8ull * M * kF;                          // 4*M*F BF16 bytes
     const uint64_t stamp_bytes = LGC_STAMP_OFF + 64ull * 4096ull;
     const uint64_t cap = std::max<uint64_t>(P, stamp_bytes);
-    uint64_t gran = std::max<uint64_t>(static_cast<uint64_t>(comm->vmmGranularity), 4ull << 20);
+    uint64_t gran = 4ull << 20;                                // ccoComm is an opaque type in hipcc TUs (cco.hpp l.925): no member access here. The comm-reported granule (4096) is below 4 MiB anyway, so 4 MiB is what r8g used
     if (const char* ge = std::getenv("LG_WINDOW_GRAN_MIB")) { const uint64_t m = std::strtoull(ge, nullptr, 10); if (m > 0 && (m << 20) > gran) gran = m << 20; }
     const uint64_t need = std::max<uint64_t>(P + LG_R_PAD_BYTES, cap);
     const uint64_t Ws = (need + gran - 1) / gran * gran;
@@ -277,6 +273,10 @@ int main(int argc, char** argv) {
     reqs.sdmaQueueCount = 1;                                   // one SDMA queue per peer (more queues were slower in the sdma bench)
     ccoDevComm dev{};
     CHECK_CCO(ccoDevCommCreate(comm, &reqs, &dev));
+    if (dev.lsaSize != 4 || static_cast<uint32_t>(dev.lsaRank) != static_cast<uint32_t>(rank)) {   // topology guard through the public ccoDevComm (complete in every pass): 4 ranks on ONE node with rank == lsaRank
+        fprintf(stderr, "rank %d: topology guard failed (lsaSize %d lsaRank %d): need 4 ranks on ONE node with rank == lsaRank\n", rank, static_cast<int>(dev.lsaSize), static_cast<int>(dev.lsaRank));
+        dist_abort(1);
+    }
     if (dev.sdma.sdmaNumQueue != 1) { fprintf(stderr, "rank %d: sdmaNumQueue %d != 1\n", rank, static_cast<int>(dev.sdma.sdmaNumQueue)); dist_abort(1); }
 
     // ---------------- deterministic per-rank inputs ----------------
