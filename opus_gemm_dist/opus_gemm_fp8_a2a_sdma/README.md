@@ -33,6 +33,9 @@ the results section were measured in the private harness with the unchanged gold
 
 - `--puts-per-peer 1|2|4` (n1/n2/n4): number of SDMA PUTs (put groups) per peer per epoch. The best n differs per T (see results). `0` = default by M (1 / 2 / 4).
 - `--half-first` (n2h/n4h): the first put group of every peer is computed as half-N (256x128) items so the first PUT starts earlier (needs `--puts-per-peer 2|4`; M = 2048 is where it matters).
+- `--quarter-first` (**n3q**, dense build and `--M 2048` only): the first put group of every peer is computed as **128x128 quarter items** (one row half of one column half of a tile) and the chain uses **three put groups of 2 / 1 / 5 chunks** per peer
+  (implies `--puts-per-peer 3`; host plan code `half_first = 2`). Group 0 (chunks 0-1, 216 quarter items) completes after about a quarter-tile time so the first PUT starts earlier; group 1 (chunk 2) is ready while group 0 is still on the wire, so the link stays busy; group 2 (chunks 3-7)
+  follows. Arrivals per remote (destination, group) are 72 / 9 / 45; 450 items + 1 poster block. Exactly the dense numerics (same MFMA chain and epilogue per element). Entry `lg_r9_gemm_n3q_v1`; it traps in indexer builds.
 - `--M`, `--warmup`, `--iters`, `--check-rows`, `--exact`, `--poll-budget-us`: see `--help`.
 
 ## Design notes
@@ -49,6 +52,11 @@ the results section were measured in the private harness with the unchanged gold
 - **Group order and half-first.** Remote items are ordered by put group (g-major), so the first wave completes group 0 of all three peers together; self tiles
   run last and are written straight into `R[rank]`. With `--half-first`, group 0 uses 256x128 half items (each about 0.77 of a tile time), making group 0 ready
   after about half a tile time.
+- **Quarter-first (n3q).** `quarter_body` is the half-N pipeline with ONE A half and one accumulator (128 rows x 128 columns; half the MFMAs and A traffic of a half item, same B layout), in its own inlined copy so the other item kinds' registers are unaffected. A true 256x64 quarter-N was not used because the B layouts
+  are fixed at 128 columns. A pipe-continuity model (`tests/` of the private candidate) shows that a two-group split [2 quarter chunks][6 full chunks] would leave the link idle before the second put, hence the 2 / 1 / 5 split. Static proof: `r9_order_ok(8)` (bijection, every 128x128 quarter once, per-group arrivals 72 / 9 / 45).
+- **No dispatch-packet read on the entry path (`NO_GRIDREAD=1`, default).** The original config guard read the AQL dispatch packet (`grid_size_x`, an `s_load` at packet offset 0xc) in **every** workgroup, including the poster, before any work, to check that the launched grid equals the plan. That scalar load sits on the critical path
+  of every WG entry (about 3.5-4 us at small M). The guard now uses the compile-time plan grid, and ONE item block (item 0, thread 0) compares the real packet value **after its work** and poisons CONFIG on a mismatch. `NO_GRIDREAD=0` restores the entry read (A/B), `NO_GRIDREAD=2` removes the packet read entirely (the host launcher computes the same grid; the device-side backstop is lost).
+  A mismatched grid is therefore detected at the end of item 0 instead of before any work: the host launcher always computes the plan grid, so this only matters for a buggy caller.
 - **IK owner and IQ.** The IK column segment is computed by one item per chunk (full tile through the same pipeline, one BF16 rounding) and stored to the
   local `R` and to the three remote staging slabs; IQ is one single-destination item per destination.
 - **Reuse compact layout (human-approved: reuse transfers only q/k/v).** The reuse receiver reads only `packed.split([2048,128,128,...])[:3]`. CCO has only
@@ -94,6 +102,7 @@ Production flags are fixed by the Makefile (`FOLD=0`, L2b release, full remote t
 ```bash
 # 4 ranks on GPUs 0..3 of one node (DEVICES=0,1,2,3 is the default; pick other GPUs with DEVICES=4,5,6,7)
 ./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 2048 --puts-per-peer 2 --half-first   # T=8192 (half-first needs n = 2 or 4)
+./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 2048 --quarter-first                 # T=8192, n3q (dense/reuse build, M = 2048 only)
 ./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case dense   --M 4096 --puts-per-peer 2 --warmup 5 --iters 50
 ./run_4rank.sh build_dense/fp8_a2a_sdma_dense.exe   --case reuse   --M 8192 --puts-per-peer 4
 ./run_4rank.sh build_indexer/fp8_a2a_sdma_indexer.exe --case indexer --M 2048 --puts-per-peer 2 --half-first
@@ -128,7 +137,8 @@ every dot product is exact, and the result must be **byte-identical**; with rand
 
 | Make variable | effect |
 |---|---|
-| `FOLD=1` | poster block folds W2/reset/epoch; no `quiet_ready` launch |
+| `FOLD=1` | poster block folds W2/reset/epoch; no `quiet_ready` launch (measured slower at T8192) |
+| `NO_GRIDREAD=0` / `2` | A/B: restore the entry-path `grid_size_x` read / remove the packet read entirely (default `1`: read only once, after item 0's work) |
 | `DEBUG_POSTCOUNT=1` | per-`(peer, group)` post counters (exactly-once check) |
 | `STAMPS=1` | same-GPU `s_memrealtime` stamps (never compare stamps across ranks) |
 
@@ -140,12 +150,12 @@ Source: the private project ledger (confirmations by an independent evidence rol
 
 | Case | T = 8192 (M = 2048) | T = 16384 (M = 4096) | T = 32768 (M = 8192) |
 |---|---|---|---|
-| dense | 1.148 best (n2h; **below 1.20**) | 1.311 / 1.299 (n2) | 1.378 / 1.384 (n4) |
+| dense | **1.2251 / 1.2182** (r11 n3q: quarter-first + no grid read; r8g F0 n2h was 1.148) | 1.311 / 1.299 (n2) | 1.378 / 1.384 (n4) |
 | indexer | 1.2185 / 1.2219 (n2h) | 1.4240 (n4) | 1.4745 (n4) |
 | reuse (q/k/v only) | 1.2191 / 1.2189 (n2h) | 1.3363 (n4); 1.3884 in a later window (n2) | 1.3372 (n4); 1.4816 in a later window (n4) |
 
-Two numbers in a cell are two independent windows (ledger r115 dense, r123 indexer T8192, r128/r129 reuse T8192); a single number is the confirming window of r118; "later window" values are the r128 first-window F0 results quoted in the ledger. Dense T = 8192 is the only large-T cell below 1.20 (best 1.148, ledger r129); small M (T = 64 / 128) is not part of this directory.
-### Standalone results of this program
+Two numbers in a cell are two independent windows (ledger r115 dense, r123 indexer T8192, r128/r129 reuse T8192); a single number is the confirming window of r118; "later window" values are the r128 first-window F0 results quoted in the ledger. Dense T = 8192 (r11 n3q, two windows) now also clears 1.20: all 15 large-T cells are at or above 1.20 (the indexer/reuse T = 8192 cells are as confirmed with r7 n2h and r8g F0 n2h). Small M (T = 64 / 128) is not part of this directory.
+### Standalone results of this program (r8g-era build: n1/n2/n4/n2h only; the r11 n3q plan and `NO_GRIDREAD` have not been timed standalone yet)
 
 GEMM + SDMA chain only (no receiver), MI355X gfx950, 4 ranks on GPUs 4–7, default non-MPI launch (`run_4rank.sh`), eager launches timed with hipEvents, `--warmup 10 --iters 101`, one repeat; reported value is µs per epoch, max over ranks. Validation samples 16 rows per source rank × all packed columns × 4 destinations: `--exact` inputs are byte-equal to the host reference, random inputs pass `rtol = atol = 0.02`, and the poison word is 0 on all ranks.
 
@@ -164,6 +174,6 @@ These numbers are not comparable to the full-chain ratios above, which include t
 
 ## Provenance
 
-Ported without algorithm changes from the private playground candidate LG-QSDMA-r8 at r8g (manifest `a6e3988b19be3b0d59c38eaf2a984fa9a7e22ec821cf1e2b886868fc78859892`), production configuration `FOLD=0`:
-`gemm_fp8_a2a_sdma_kernel.cc` is `device/gemm_quad_fp8_comm.cu`; `lg_comm_device.hpp`, `lg_r6x.hpp`, `epilogue_ptpc_pairstore.hpp`, `layout/*`, `lg_comm_abi_v2.h` are copied unchanged. The Python bridge and the
+Ported without algorithm changes from the private playground candidate LG-QSDMA-r11 (manifest `9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643`) = r10 (`LG_NO_GRIDREAD`) + r9 (quarter-first n3q) on the r8g base (`a6e3988b19be3b0d59c38eaf2a984fa9a7e22ec821cf1e2b886868fc78859892`), production configuration `FOLD=0`:
+`gemm_fp8_a2a_sdma_kernel.cc` is `device/gemm_quad_fp8_comm.cu`; `lg_comm_device.hpp`, `lg_r6x.hpp`, `epilogue_ptpc_pairstore.hpp`, `layout/*`, `lg_comm_abi_v2.h` are copied unchanged from r11. The Python bridge and the
 ctypes driver are replaced by `main.cc` (default non-MPI process group; MPI behind `USE_MPI=1`).

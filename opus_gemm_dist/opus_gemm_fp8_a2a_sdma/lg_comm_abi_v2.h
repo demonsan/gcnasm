@@ -71,8 +71,11 @@ static_assert(LG_COMM_F % LG_TILE_N == 0, "slab columns must be a whole number o
 #ifndef LG_X_POSTER_LAST
 #define LG_X_POSTER_LAST 0            /* X-L test hook (debug only): poster = the LAST blockIdx (grid_items), items = blockIdx 0.. (poster dispatched last) */
 #endif
+#ifndef LG_NO_GRIDREAD
+#define LG_NO_GRIDREAD 1              /* r10: 1 = the entry config guard uses the COMPILE-TIME plan grid (no AQL dispatch-packet grid_size_x s_load in any WG entry path); ONE item block (block id 1) compares the real packet value at the END of its work and poisons CONFIG on mismatch. 2 = no packet read at all (dispatch_ptr dropped from the descriptor; the host grid is the only check). 0 = r8g behaviour (every block reads grid_size_x at entry), for A/B. */
+#endif
 #ifndef LG_R8_FOLD
-#define LG_R8_FOLD 1                  /* r8 A2: the poster block folds W2 (wait own arrivals) + device reset + epoch advance; the quiet_ready kernel is NOT launched. 0 = r7 behaviour (quiet_ready kernel). HOST AND DEVICE MUST AGREE (plan code bit 0x400). */
+#define LG_R8_FOLD 0                  /* r8 A2: the poster block folds W2 (wait own arrivals) + device reset + epoch advance; the quiet_ready kernel is NOT launched. 0 = r7 behaviour (quiet_ready kernel). HOST AND DEVICE MUST AGREE (plan code bit 0x400). */
 #endif
 #define LGC_FOLD_CNT_OFF (LGC_LOCK_OFF + 60u)   /* u32 fold counter: lock word 15 (unused by the r6 poster path; r4 locks use words 0..15 only in the r5b CAS build); device-reset by the last folded waiter */
 #define LG_R_PAD_BYTES 4096u          /* r8 A1: R window padding so a [T,2560] view with row stride 2304 (reuse) stays inside the allocation */
@@ -85,7 +88,7 @@ static_assert(LG_COMM_F % LG_TILE_N == 0, "slab columns must be a whole number o
 #ifndef LG_R6_ARRIVAL_ACQ
 #define LG_R6_ARRIVAL_ACQ 0           /* r6b default 0: producers' counter RMW is RELAXED after the release fence (review P-C2b: release sequence headed by the fence); 1 = ACQUIRE (the r5b-measured form) kept as an option */
 #endif
-#define LG_R6_PLAN_CODE_N(n, hg) ((LG_R6_POSTER ? 0x10000ull : 0ull) | (static_cast<uint64_t>(n) << 4) | (LG_REMOTE_HALF ? 1ull : 0ull) | (LG_X_INDEXER ? 0x100ull : 0ull) | ((hg) ? 0x200ull : 0ull) | (LG_R8_FOLD ? 0x400ull : 0ull))   /* args.reserved[0] must equal this for the entry (poster, n, half, indexer, r7 half-first-group bit 0x200) */
+#define LG_R6_PLAN_CODE_N(n, hg) ((LG_R6_POSTER ? 0x10000ull : 0ull) | (static_cast<uint64_t>(n) << 4) | (LG_REMOTE_HALF ? 1ull : 0ull) | (LG_X_INDEXER ? 0x100ull : 0ull) | (((hg) == 1) ? 0x200ull : (((hg) == 2) ? 0x800ull : 0ull)) | (LG_R8_FOLD ? 0x400ull : 0ull))   /* args.reserved[0] must equal this for the entry (poster, n, half, indexer, r7 half-first-group bit 0x200) */
 #ifndef LG_L1C_SWIZZLE
 #define LG_L1C_SWIZZLE 0              /* r5 L1c: XCC-blocked W n-band order (wgid = 8*j + x, XCC x owns contiguous bands, m-major slots). 0 = r4 order. Needs chunks % 8 == 0, else r4 order at runtime. */
 #endif
@@ -129,6 +132,9 @@ enum { LGC_POISON_W1_TIMEOUT = 1, LGC_POISON_W2_TIMEOUT = 2, LGC_POISON_EPOCH_MI
 #define LG_ENTRY_GEMM_N4 "lg_r6x_gemm_n4_v1"
 #define LG_ENTRY_GEMM_N2H "lg_r7_gemm_n2h_v1"   /* r7: half-N first group (group 0 remote tiles as 256x128 items), n = 2 / 4 */
 #define LG_ENTRY_GEMM_N4H "lg_r7_gemm_n4h_v1"
+#define LG_ENTRY_GEMM_N3Q "lg_r9_gemm_n3q_v1"   /* r9: quarter-first, THREE put groups per peer (chunks [0,2) as 128x128 quarter items, [2,3) and [3,8) as full tiles), dense M=2048 only; plan code bit 0x800 (host half_first = 2) */
+#define LG_R9_QC 2                              /* chunks in group 0 of the quarter-first plan (the first LG_R9_QC chunk rows run as quarter items) */
+#define LG_R9_G1 1                              /* chunks in group 1 (full tiles); group 2 = the remaining chunks - LG_R9_QC - LG_R9_G1 */
 #define LG_ENTRY_DRAIN "lg_drain_all_v2"           /* r6b host recovery step: quietQueue on every peer queue (run + sync before any re-init after a poisoned epoch) */
 #define LG_POLL_BUDGET_US_DEFAULT 50000u          /* r6b: poster/quiet_ready wait budget in microseconds (s_memrealtime, 100 MHz); passed in args.reserved[1] (must be non-zero). Must exceed worst-case GEMM time + rank skew + late poster dispatch at M=8192 (GEMM ~0.26-1.3 ms there). */
 

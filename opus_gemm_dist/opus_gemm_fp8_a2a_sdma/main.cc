@@ -130,6 +130,7 @@ extern "C" __global__ void lg_r6x_gemm_n2_v1(LgCommArgsV2);
 extern "C" __global__ void lg_r6x_gemm_n4_v1(LgCommArgsV2);
 extern "C" __global__ void lg_r7_gemm_n2h_v1(LgCommArgsV2);
 extern "C" __global__ void lg_r7_gemm_n4h_v1(LgCommArgsV2);
+extern "C" __global__ void lg_r9_gemm_n3q_v1(LgCommArgsV2);                       // quarter-first, 3 put groups (dense, M = 2048 only)
 extern "C" __global__ void lg_quiet_ready_v2(LgCommArgsV2);
 extern "C" __global__ void lg_drain_all_v2(LgCommArgsV2);
 
@@ -191,6 +192,7 @@ void usage(int rank) {
         "  --M <rows per rank>          M = T/4, multiple of 256, <= 8192 (T = 4M: 8192/16384/32768 -> M 2048/4096/8192). default 2048\n"
         "  --puts-per-peer 1|2|4        SDMA puts (put groups) per peer per epoch; 0 = default by M (1/2/4). default 0\n"
         "  --half-first                 r7 half-N first group (needs --puts-per-peer 2|4)\n"
+        "  --quarter-first              r9 quarter-first plan n3q: group 0 as 128x128 quarter items, THREE put groups of 2/1/5 chunks (dense build, M = 2048 only; implies --puts-per-peer 3)\n"
         "  --warmup <n> --iters <n>     default 5 / 50\n"
         "  --check-rows <n>             validated rows per source rank (all columns). default 16\n"
         "  --exact                      exact-arithmetic inputs ({+-0.5,+-1,+-2}, unit scales): byte-exact validation (default: random inputs, tolerance rtol=atol=0.02)\n"
@@ -208,7 +210,7 @@ int main(int argc, char** argv) {
     Case cs = Case::Dense;
     uint32_t M = 2048, puts = 0, warmup = 5, iters = 50, check_rows = 16;
     uint64_t budget_us = 0;
-    bool half_first = false, exact = false;
+    bool half_first = false, quarter_first = false, exact = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* name) -> const char* { if (i + 1 >= argc) { if (rank == 0) fprintf(stderr, "%s needs a value\n", name); usage(rank); dist_abort(2); } return argv[++i]; };
@@ -219,6 +221,7 @@ int main(int argc, char** argv) {
         } else if (a == "--M" || a == "-M") M = static_cast<uint32_t>(std::atoi(next("--M")));
         else if (a == "--puts-per-peer") puts = static_cast<uint32_t>(std::atoi(next("--puts-per-peer")));
         else if (a == "--half-first") half_first = true;
+        else if (a == "--quarter-first") quarter_first = true;
         else if (a == "--warmup") warmup = static_cast<uint32_t>(std::atoi(next("--warmup")));
         else if (a == "--iters") iters = static_cast<uint32_t>(std::atoi(next("--iters")));
         else if (a == "--check-rows") check_rows = static_cast<uint32_t>(std::atoi(next("--check-rows")));
@@ -236,11 +239,16 @@ int main(int argc, char** argv) {
                                case_name(cs), cs == Case::Indexer ? "indexer" : "dense", static_cast<int>(LG_X_INDEXER), kF, cs == Case::Indexer ? "indexer" : "dense");
         dist_abort(2);
     }
-    const uint32_t npp = puts ? puts : default_puts_per_peer(M);
     const uint32_t chunks = M / LG_CHUNK_ROWS;
-    if (npp != 1u && npp != 2u && npp != 4u) { if (rank == 0) fprintf(stderr, "--puts-per-peer must be 1, 2 or 4\n"); dist_abort(2); }
+    if (quarter_first) {                                       // r9 n3q plan: host half_first = 2 with puts_per_peer = 3; dense build, M = 2048 (8 chunks) only
+        if (half_first || (puts != 0 && puts != 3)) { if (rank == 0) fprintf(stderr, "--quarter-first excludes --half-first and implies --puts-per-peer 3\n"); dist_abort(2); }
+        if (build_indexer || chunks != 8u) { if (rank == 0) fprintf(stderr, "--quarter-first needs the dense build (PLAN=dense) and --M 2048 (8 chunks)\n"); dist_abort(2); }
+        puts = 3;
+    }
+    const uint32_t npp = puts ? puts : default_puts_per_peer(M);
+    if (!quarter_first && npp != 1u && npp != 2u && npp != 4u) { if (rank == 0) fprintf(stderr, "--puts-per-peer must be 1, 2 or 4\n"); dist_abort(2); }
     if (half_first && npp == 1u) { if (rank == 0) fprintf(stderr, "--half-first needs --puts-per-peer 2 or 4\n"); dist_abort(2); }
-    if (chunks % npp != 0u) { if (rank == 0) fprintf(stderr, "chunks (M/256 = %u) must be divisible by --puts-per-peer %u\n", chunks, npp); dist_abort(2); }
+    if (!quarter_first && chunks % npp != 0u) { if (rank == 0) fprintf(stderr, "chunks (M/256 = %u) must be divisible by --puts-per-peer %u\n", chunks, npp); dist_abort(2); }
 
     int ndev = 0;
     CHECK_HIP(hipGetDeviceCount(&ndev));
@@ -319,14 +327,16 @@ int main(int argc, char** argv) {
     args.M = M; args.N = kN; args.K = kK; args.strideA = kK; args.F = kF; args.rank = static_cast<uint32_t>(rank);
     args.chunks = chunks; args.abi_version = LG_COMM_ABI_VERSION; args.poll_iterations = 2000000;
     args.sdma_queues = 1; args.items_per_group = LG_ITEMS_PER_GROUP;
-    args.reserved[0] = LG_R6_PLAN_CODE_N(npp, half_first ? 1 : 0);
+    const uint32_t hg = quarter_first ? 2u : (half_first ? 1u : 0u);   // plan code / grid selector: 0 = r6x, 1 = half-first (r7), 2 = quarter-first (r9)
+    args.reserved[0] = LG_R6_PLAN_CODE_N(npp, hg);
     args.reserved[1] = budget_us ? budget_us : LG_POLL_BUDGET_US_DEFAULT;
-    const uint32_t hg = half_first ? 1u : 0u;
-    // grid = 1 poster block + items (36 dense / 41 indexer per chunk; half-first adds 3*9*(chunks/n) items)
-    const uint32_t grid = LG_X_ITEMS_PER_CHUNK * chunks + (hg ? LG_NUM_PEERS * LG_TILES_N_PER_DEST * (chunks / npp) : 0u) + 1u;
+    // grid = 1 poster block + items (36 dense / 41 indexer per chunk; half-first adds 3*9*(chunks/n); quarter-first n3q: 3*9*(2*4 + (chunks-2)) + 9*chunks = 450 items at M=2048)
+    const uint32_t grid = hg == 2u ? LG_NUM_PEERS * LG_TILES_N_PER_DEST * (LG_R9_QC * 4u + (chunks - LG_R9_QC)) + LG_TILES_N_PER_DEST * chunks + 1u
+                                   : LG_X_ITEMS_PER_CHUNK * chunks + (hg ? LG_NUM_PEERS * LG_TILES_N_PER_DEST * (chunks / npp) : 0u) + 1u;
     hipStream_t stream; CHECK_HIP(hipStreamCreate(&stream));
     auto launch_epoch = [&]() {
-        if (hg)  { if (npp == 2u) hipLaunchKernelGGL(lg_r7_gemm_n2h_v1, dim3(grid), dim3(512), 0, stream, args); else hipLaunchKernelGGL(lg_r7_gemm_n4h_v1, dim3(grid), dim3(512), 0, stream, args); }
+        if (hg == 2u) { hipLaunchKernelGGL(lg_r9_gemm_n3q_v1, dim3(grid), dim3(512), 0, stream, args); }
+        else if (hg)  { if (npp == 2u) hipLaunchKernelGGL(lg_r7_gemm_n2h_v1, dim3(grid), dim3(512), 0, stream, args); else hipLaunchKernelGGL(lg_r7_gemm_n4h_v1, dim3(grid), dim3(512), 0, stream, args); }
         else     { if (npp == 1u) hipLaunchKernelGGL(lg_r6x_gemm_n1_v1, dim3(grid), dim3(512), 0, stream, args); else if (npp == 2u) hipLaunchKernelGGL(lg_r6x_gemm_n2_v1, dim3(grid), dim3(512), 0, stream, args); else hipLaunchKernelGGL(lg_r6x_gemm_n4_v1, dim3(grid), dim3(512), 0, stream, args); }
 #if !LG_R8_FOLD
         hipLaunchKernelGGL(lg_quiet_ready_v2, dim3(1), dim3(256), 0, stream, args);      // F0 (production): W2 + device reset + epoch advance in a separate 1-WG kernel
@@ -422,8 +432,8 @@ int main(int argc, char** argv) {
     const bool poisoned = check_poison_all("timing");
     uint64_t ep, done; uint32_t poison; read_report(&ep, &poison, &done);
     if (rank == 0) {
-        printf("config: case=%s build(F=%u N=%u fold=%d) M=%u (T=%u) puts_per_peer=%u half_first=%d grid=%u warmup=%u iters=%u\n",
-               case_name(cs), kF, kN, static_cast<int>(LG_R8_FOLD), M, 4 * M, npp, half_first ? 1 : 0, grid, warmup, iters);
+        printf("config: case=%s build(F=%u N=%u fold=%d) M=%u (T=%u) puts_per_peer=%u plan=%s no_gridread=%d grid=%u warmup=%u iters=%u\n",
+               case_name(cs), kF, kN, static_cast<int>(LG_R8_FOLD), M, 4 * M, npp, hg == 2u ? "quarter-first(n3q)" : (hg == 1u ? "half-first" : "n"), static_cast<int>(LG_NO_GRIDREAD), grid, warmup, iters);
         printf("epoch (GEMM + SDMA a2a + %s): max over ranks %.1f us, mean %.1f us; per-rank PUT %.2f MB/epoch -> %.1f GB/s per rank (%.1f GB/s aggregate over 4 ranks)\n",
                LG_R8_FOLD ? "folded W2/reset" : "quiet_ready", us_max, us_sum / kNumRanks, out_bytes / 1e6, out_bytes / (us_max * 1e3), 4.0 * out_bytes / (us_max * 1e3));
         printf("rank 0 report: ep=%llu epochs_done=%llu poison=%u\n", static_cast<unsigned long long>(ep), static_cast<unsigned long long>(done), poison);

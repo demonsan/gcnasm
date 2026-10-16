@@ -155,6 +155,83 @@ __device__ __forceinline__ void half_body(const LgCommArgsV2& args, const lgc::X
         lgc::x_publish<NP, HG>(args, dd, 0, 0, nd, static_cast<uint32_t>(chunk));
     }
 }
+// ---- r9 QUARTER item (128 rows x 128 cols = ONE hm half of ONE hn half of a 256x256 tile): the proven half pipeline with ONE A half (msel) and ONE accumulator. Same per-element MFMA chain (K ascending,
+// mma(a,b,c,127,127,0,0), swap_ab), same epilogue math (one RNE), same B layout; A half msel lands in s_a[buf][0] (the A layouts are per-half and identical for both halves). 4 loads per K-tile (2 A + 2 B).
+template<int NP, int HG>
+__device__ __forceinline__ void quarter_body(const LgCommArgsV2& args, const lgc::XItem& xi, char* smem_a, char* smem_b) {
+    using namespace opus;
+    using opus::operator""_I;
+    using T = lgq::Q;
+    const int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
+    const int lane_id = opus::thread_id_x() % get_warp_size();
+    const int M = static_cast<int>(args.M), K = static_cast<int>(args.K);
+    const int wave_id_m = wave_id / T::T_N, wave_id_n = wave_id % T::T_N;
+    smem<fp8_t> s_a[2] = {make_smem(reinterpret_cast<fp8_t*>(smem_a)), make_smem(reinterpret_cast<fp8_t*>(smem_a + T::smem_a_bytes))};
+    smem<fp8_t> s_b[2] = {make_smem(reinterpret_cast<fp8_t*>(smem_b)), make_smem(reinterpret_cast<fp8_t*>(smem_b + T::smem_b_bytes))};
+    auto mma = make_tiled_mma<fp8_t, fp8_t, fp32_t>(
+        seq<T::E_M, T::E_N, T::E_K>{}, seq<T::T_M, T::T_N, T::T_K>{}, seq<T::W_M, T::W_N, T::W_K>{}, mfma_adaptor_swap_ab{});
+    using MMA = decltype(mma);
+    auto mma_fp8 = [&](const auto& a_, const auto& b_, const auto& c_) { return mma(a_, b_, c_, 127, 127, number<0>{}, number<0>{}); };
+    const int stride_band = 16 * K;
+    auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, static_cast<int>(args.strideA));
+    auto u_sa = make_layout_sa<T>(wave_id_m, wave_id_n);
+    auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
+    auto u_gb = make_layout_gb_phys<T>(lane_id, wave_id, stride_band);
+    auto u_sb = make_layout_sb_phys<T>(wave_id_m, wave_id_n);
+    auto u_rb = make_layout_rb_phys<T>(lane_id, wave_id_n);
+
+    const int chunk = xi.chunk;
+    const int row = chunk * T::B_M;
+    const int hn = xi.nsel & 1, msel = xi.nsel >> 1;                  // column half, row half of the 256x256 tile
+    const int raw = lgq::ht_raw((half_dest<lgc::T_HN>(args, xi) * static_cast<int>(LG_TILES_N_PER_DEST) + xi.nloc) * 2 + hn);   // only `raw` is item-dependent inside the K loop
+    auto g_a = make_gmem(reinterpret_cast<const fp8_t*>(args.A) + static_cast<long long>(row) * args.strideA,
+                         static_cast<unsigned int>(static_cast<unsigned long long>(M - row) * args.strideA));
+    auto g_b = make_gmem(reinterpret_cast<const fp8_t*>(args.W), static_cast<unsigned int>(args.N) * static_cast<unsigned int>(K));
+    auto a_offset = [&](int tile_k) { return msel * T::HALF_B_M * static_cast<int>(args.strideA) + tile_k * T::B_K; };
+    auto b_offset = [&](int tile_k) { return (raw / 16) * stride_band + tile_k * T::BAND_BYTES_PER_KTILE; };
+
+    typename MMA::vtype_a v_a;
+    typename MMA::vtype_b v_b;
+    typename MMA::vtype_c v_c;
+    clear(v_c);
+    const int loops = K / T::B_K;                                      // 48
+    constexpr int LOADS = T::a_buffer_load_insts + T::b_buffer_load_insts;   // 4 per K-tile (one A half + B)
+    auto issue = [&](int buf, int tile_k) {
+        async_load<T::VEC_B>(g_b, s_b[buf].ptr, u_gb, u_sb, b_offset(tile_k));
+        async_load<T::VEC_A>(g_a, s_a[buf].ptr, u_ga, u_sa, a_offset(tile_k));
+    };
+    issue(0, 0);
+    issue(1, 1);                                                       // loops >= 2
+    auto step = [&](auto cbuf, int k) {
+        constexpr int buf = decltype(cbuf)::value;
+        if (k + 1 < loops) s_waitcnt_vmcnt(number<LOADS>{});           // tile k landed (tile k+1 may still be in flight)
+        else               s_waitcnt_vmcnt(0_I);
+        __builtin_amdgcn_s_barrier();                                  // all waves' tile-k LDS writes visible
+        v_b = load<T::VEC_B>(s_b[buf], u_rb);
+        v_a = load<T::VEC_A>(s_a[buf], u_ra);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();                                  // everyone finished reading buf: safe to overwrite
+        if (k + 2 < loops) issue(buf, k + 2);
+        __builtin_amdgcn_s_setprio(1);
+        v_c = mma_fp8(v_a, v_b, v_c);
+        __builtin_amdgcn_s_setprio(0);
+    };
+    for (int k = 0; k < loops; k += 2) { step(number<0>{}, k); step(number<1>{}, k + 1); }   // loops even
+    const float* const w_scale = args.Wscale;
+    const float* const a_scale = args.Ascale;
+    const int q = lane_id / 16, l16 = lane_id % 16;
+    const long long slab_elems = static_cast<long long>(M) * lgq::kFS;
+    bf16_t* const sbase = reinterpret_cast<bf16_t*>(mori::cco::ccoGetLocalPtr(args.Swin, 0));
+    const int dd = half_dest<lgc::T_HN>(args, xi);                     // remote destination (quarters are remote-only)
+    bf16_t* const c_slab = sbase + static_cast<long long>(dd) * slab_elems;
+    const int packed = lgq::ht_packed((dd * static_cast<int>(LG_TILES_N_PER_DEST) + xi.nloc) * 2 + hn);
+    HalfScales ws; load_ws(w_scale, raw, wave_id_n, q, ws);
+    {
+        float as[T::E_M]; load_as(a_scale, row, msel, wave_id_m, l16, as);
+        store_c_ptpc(v_c, ws, as, c_slab, row + msel * T::HALF_B_M, packed, lane_id, wave_id_m, wave_id_n, dd != static_cast<int>(args.rank));
+    }
+    lgc::x_publish<NP, HG>(args, dd, 0, 0, 1, static_cast<uint32_t>(chunk));
+}
 } // namespace lgq
 
 namespace lgq {
@@ -460,31 +537,12 @@ __device__ __forceinline__ void tile_body(const LgCommArgsV2& args, const lgc::X
 }
 
 template<int NP, int HG>
-__device__ __forceinline__ void gemm_body(const LgCommArgsV2& args) {
-    using namespace opus;
-    using T = lgq::Q;
-    __shared__ char smem_a[T::smem_a_bytes * 4];
-    __shared__ char smem_b[T::smem_b_bytes * 4];
-    // config guard (block-uniform, before any barrier): host/device plan must agree, else poison + uniform return (nothing is released: peers' bounded waits poison too).
-    // r6x L-G (review r5x): gridDim must equal the plan (items + 1 poster block); an oversized grid would map extra blocks to chunk >= chunks and write out of bounds.
-    const int nblocks = static_cast<int>(opus::grid_size_x()) / 512;
-    if (args.items_per_group != LG_ITEMS_PER_GROUP || args.abi_version != LG_COMM_ABI_VERSION || args.sdma_queues != 1u || args.chunks > LG_MAX_CHUNKS ||
-        args.chunks != args.M / 256u || (args.chunks % static_cast<uint32_t>(NP)) != 0u || args.reserved[0] != LG_R6_PLAN_CODE_N(NP, HG) || args.reserved[1] == 0ull ||
-        args.N != LG_X_N_RAW || args.F != LG_COMM_F || nblocks != lgc::grid_of<NP, HG>(static_cast<int>(args.chunks)) + 1) {
-        if (opus::block_id_x() == 0 && opus::thread_id_x() == 0) lgc::set_poison(args, LGC_POISON_CONFIG);
-        return;
+__device__ __forceinline__ void run_item(const LgCommArgsV2& args, const lgc::XItem& xi, char* smem_a, char* smem_b) {
+    // uniform (block-uniform, SGPR) dispatch on the item kind: separately inlined tile bodies, the kind-specific state is NOT shared across them
+    if constexpr (HG == 2) {                                          // r9 quarter-first plan (dense): quarter items in their OWN copy
+        if (xi.type == lgc::T_QN) { quarter_body<NP, HG>(args, xi, smem_a, smem_b); return; }
     }
-#if LG_X_POSTER_LAST
-    if (static_cast<int>(opus::block_id_x()) == lgc::grid_of<NP, HG>(static_cast<int>(args.chunks))) { lgc::r6_poster_block<NP, HG>(args); return; }   // X-L hook: poster = LAST block id
-    const int item_bid = static_cast<int>(opus::block_id_x());
-#else
-    if (opus::block_id_x() == 0) { lgc::r6_poster_block<NP, HG>(args); return; }                  // block-uniform: the poster block never reaches the item/barrier code below
-    const int item_bid = static_cast<int>(opus::block_id_x()) - 1;
-#endif
-    lgc::stamp_entry(args);
-    const lgc::XItem xi = lgc::select_item_h<NP, HG>(item_bid, static_cast<int>(args.chunks));
-    // uniform (block-uniform, SGPR) dispatch on the item kind: three separately inlined tile bodies, the kind-specific state is NOT shared across them
-    if constexpr (HG) {                                               // r7 half-first plan: half-N kinds in their own copies
+    if constexpr (HG == 1) {                                          // r7 half-first plan: half-N kinds in their own copies
         if (xi.type == lgc::T_HN) { half_body<NP, HG, lgc::T_HN>(args, xi, smem_a, smem_b); return; }
 #if LG_X_INDEXER
         if (xi.type == lgc::T_HK) { half_body<NP, HG, lgc::T_HK>(args, xi, smem_a, smem_b); return; }
@@ -498,7 +556,46 @@ __device__ __forceinline__ void gemm_body(const LgCommArgsV2& args) {
     }
 #endif
     tile_body<NP, HG, lgc::T_NORMAL>(args, xi, smem_a, smem_b);
-}} // namespace lgq
+}
+
+template<int NP, int HG>
+__device__ __forceinline__ void gemm_body(const LgCommArgsV2& args) {
+    using namespace opus;
+    using T = lgq::Q;
+    __shared__ char smem_a[T::smem_a_bytes * 4];
+    __shared__ char smem_b[T::smem_b_bytes * 4];
+    // config guard (block-uniform, before any barrier): host/device plan must agree, else poison + uniform return (nothing is released: peers' bounded waits poison too).
+    // r6x L-G (review r5x): gridDim must equal the plan (items + 1 poster block); an oversized grid would map extra blocks to chunk >= chunks and write out of bounds.
+#if LG_NO_GRIDREAD == 0
+    const int nblocks = static_cast<int>(opus::grid_size_x()) / 512;                 // r8g: every WG reads the AQL dispatch packet (s_load s[0:1]+0xc) before any work
+#endif
+    if (args.items_per_group != LG_ITEMS_PER_GROUP || args.abi_version != LG_COMM_ABI_VERSION || args.sdma_queues != 1u || args.chunks > LG_MAX_CHUNKS ||
+        args.chunks != args.M / 256u || (HG != 2 && (args.chunks % static_cast<uint32_t>(NP)) != 0u) || args.reserved[0] != LG_R6_PLAN_CODE_N(NP, HG) || (HG == 2 && args.chunks != 8u) || args.reserved[1] == 0ull ||
+        args.N != LG_X_N_RAW || args.F != LG_COMM_F
+#if LG_NO_GRIDREAD == 0
+        || nblocks != lgc::grid_of<NP, HG>(static_cast<int>(args.chunks)) + 1
+#endif
+        ) {
+        if (opus::block_id_x() == 0 && opus::thread_id_x() == 0) lgc::set_poison(args, LGC_POISON_CONFIG);
+        return;
+    }
+#if LG_X_POSTER_LAST
+    if (static_cast<int>(opus::block_id_x()) == lgc::grid_of<NP, HG>(static_cast<int>(args.chunks))) { lgc::r6_poster_block<NP, HG>(args); return; }   // X-L hook: poster = LAST block id
+    const int item_bid = static_cast<int>(opus::block_id_x());
+#else
+    if (opus::block_id_x() == 0) { lgc::r6_poster_block<NP, HG>(args); return; }                  // block-uniform: the poster block never reaches the item/barrier code below
+    const int item_bid = static_cast<int>(opus::block_id_x()) - 1;
+#endif
+    lgc::stamp_entry(args);
+    const lgc::XItem xi = lgc::select_item_h<NP, HG>(item_bid, static_cast<int>(args.chunks));
+    run_item<NP, HG>(args, xi, smem_a, smem_b);
+#if LG_NO_GRIDREAD == 1
+    // r10 off-path grid check: ONE item block (item 0), thread 0, AFTER its work (nothing is on the entry path): the real dispatch-packet grid must equal the compile-time plan grid; a mismatch poisons CONFIG.
+    // (A mismatching oversized grid is also rejected by the host launcher, which computes the same grid; this is the device-side backstop. Extra blocks of an oversized grid would already have run: poison is the signal.)
+    if (item_bid == 0 && opus::thread_id_x() == 0 && static_cast<int>(opus::grid_size_x()) / 512 != lgc::grid_of<NP, HG>(static_cast<int>(args.chunks)) + 1) lgc::set_poison(args, LGC_POISON_CONFIG);
+#endif
+}
+} // namespace lgq
 
 // Entries: puts per peer n selected by ENTRY (one HSACO). 512 threads, 1 WG/CU (LDS 135168 B).
 extern "C" __global__ __launch_bounds__(512, 1) void lg_r6x_gemm_n1_v1(LgCommArgsV2 args) {
@@ -538,6 +635,17 @@ extern "C" __global__ __launch_bounds__(512, 1) void lg_r7_gemm_n4h_v1(LgCommArg
     __builtin_trap();
 #endif
 }
+#if !LG_X_INDEXER
+extern "C" __global__ __launch_bounds__(512, 1) void lg_r9_gemm_n3q_v1(LgCommArgsV2 args) {
+#if defined(__gfx950__)
+    lgq::gemm_body<3, 2>(args);
+#else
+    __builtin_trap();
+#endif
+}
+#else
+extern "C" __global__ __launch_bounds__(512, 1) void lg_r9_gemm_n3q_v1(LgCommArgsV2 args) { __builtin_trap(); }   // quarter-first plan is dense-only: this entry traps in indexer builds (the host rejects it first)
+#endif
 extern "C" __global__ __launch_bounds__(256)
 void lg_quiet_ready_v2(LgCommArgsV2 args) {
 #if defined(__gfx950__)
@@ -564,6 +672,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void lg_r6x_gemm_n2_v1(LgCommArg
 extern "C" __global__ __launch_bounds__(512, 1) void lg_r6x_gemm_n4_v1(LgCommArgsV2) {}
 extern "C" __global__ __launch_bounds__(512, 1) void lg_r7_gemm_n2h_v1(LgCommArgsV2) {}
 extern "C" __global__ __launch_bounds__(512, 1) void lg_r7_gemm_n4h_v1(LgCommArgsV2) {}
+extern "C" __global__ __launch_bounds__(512, 1) void lg_r9_gemm_n3q_v1(LgCommArgsV2) {}
 extern "C" __global__ __launch_bounds__(256) void lg_quiet_ready_v2(LgCommArgsV2) {}
 extern "C" __global__ __launch_bounds__(64) void lg_drain_all_v2(LgCommArgsV2) {}
 #endif

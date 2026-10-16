@@ -12,8 +12,8 @@
 namespace lgc {
 static_assert(LG_R6_POSTER == 1 && LG_REMOTE_HALF == 0, "r6x: poster path with full tiles only");
 static_assert(LG_L2A_BYPASS == 0 && !LG_NEGCTRL_NOWAIT && !LG_NEGCTRL_ISO && !LG_L1C_SWIZZLE, "r6x: L2b only; no L2a/NOWAIT/ISO/L1c");
-enum { T_NORMAL = 0, T_IQ = 1, T_IK = 2, T_HN = 3, T_HQ = 4, T_HK = 5 };   // T_H*: r7 half-N (256x128) items of the half-first plan
-struct XItem { int type; int chunk; int dslot; int nloc; int nsel; };   // nsel: half selector of T_HN (0/1); 0 elsewhere      // NORMAL: dslot 0..2 remote peers, 3 = self, nloc 0..8; IQ: nloc = pair j (0,1); IK: -
+enum { T_NORMAL = 0, T_IQ = 1, T_IK = 2, T_HN = 3, T_HQ = 4, T_HK = 5, T_QN = 6 };   // T_H*: r7 half-N (256x128) items of the half-first plan
+struct XItem { int type; int chunk; int dslot; int nloc; int nsel; };   // nsel: half selector of T_HN (0/1); T_QN: hn = nsel & 1 (column half), hm = nsel >> 1 (row half); 0 elsewhere      // NORMAL: dslot 0..2 remote peers, 3 = self, nloc 0..8; IQ: nloc = pair j (0,1); IK: -
 constexpr int XEXTRA = LG_X_INDEXER ? 5 : 0;                      // IK + IQ_0..IQ_3 (one full tile each, ONE destination) per chunk completing remote groups
 constexpr int r6x_group_items(int chunks, int np) { return (chunks / np) * static_cast<int>(LG_ITEMS_PER_GROUP); }
 constexpr int grid_items_x(int chunks) { return static_cast<int>(LG_X_ITEMS_PER_CHUNK) * chunks; }
@@ -140,9 +140,70 @@ constexpr bool r7_order_ok(int chunks, int np) {
 }
 static_assert(r7_order_ok(8, 2) && r7_order_ok(8, 4) && r7_order_ok(16, 2) && r7_order_ok(16, 4) && r7_order_ok(32, 2) && r7_order_ok(32, 4), "r7 half-first order: bijection, coverage, per-group arrivals (chunks 8/16/32 x n 2/4)");
 static_assert(grid_items_h(8, 2, 1) == (LG_X_INDEXER ? 436 : 396) && grid_items_h(8, 2, 0) == (LG_X_INDEXER ? 328 : 288), "M2048 n2 grid sizes: 436/396 half-first, 328/288 plain");
-template<int NP, int HG> __device__ constexpr int want_of(int chunks, int g) { return HG ? r7_want(chunks, NP, g) : r6x_group_items(chunks, NP); }
-template<int NP, int HG> __device__ constexpr int grid_of(int chunks) { return grid_items_h(chunks, NP, HG); }
-template<int NP, int HG> __device__ constexpr XItem select_item_h(int t, int chunks) { return HG ? select_item_r7(t, chunks, NP) : select_item_r6x(t, chunks, NP); }
+// ======================= r9: QUARTER-first group 0 (dense, M=2048, n=2; plan bit 0x800, host half_first = 2) ==========================================================================
+// A quarter item is 128 rows x 128 cols (one hm half of one hn half of a 256x256 tile): it runs the PROVEN half pipeline with ONE A half (half the MFMAs and A traffic, same B layout), so group 0 completes
+// after ~0.6x the half-first time. (A true 256x64 quarter-N needs a new 64-column B layout; not attempted: the B layouts are hard-wired to 128 columns.) Group 0 = the first LG_R9_QC chunk rows of every peer
+// as quarter items; group 1 = chunk 2 (full tiles, ready while the group-0 put is still on the wire); group 2 = the remaining chunks (full tiles); self tiles last (full). THREE puts per peer (NP = 3). Dense only.
+// Pipe model (inference, tests/pipe_model_r9.py): a 2-group split [2 quarter][6 full] leaves the link idle ~15 us before the second put (group 1 not ready when put 0 finishes) and is +6..+17 us WORSE than n2h;
+// the 3-group split [2][1][5] keeps the pipe continuous: -6 us (quarter item = 0.6 tile) .. +5 us (0.8 tile) vs n2h.
+constexpr int R9_QC = static_cast<int>(LG_R9_QC), R9_G1 = static_cast<int>(LG_R9_G1);
+constexpr int R9_NG = 3;                                           // put groups per peer in the quarter-first plan: [0,QC) quarters, [QC,QC+G1) full, [QC+G1,chunks) full
+constexpr int r9_g_first(int g) { return g == 0 ? 0 : (g == 1 ? R9_QC : R9_QC + R9_G1); }
+constexpr int r9_g_n(int g, int chunks) { return g == 0 ? R9_QC : (g == 1 ? R9_G1 : chunks - R9_QC - R9_G1); }
+constexpr int r9_group_of(int c) { return c < R9_QC ? 0 : (c < R9_QC + R9_G1 ? 1 : 2); }
+constexpr int r9_want(int chunks, int g) { return g == 0 ? R9_QC * NPD * 4 : r9_g_n(g, chunks) * NPD; }
+constexpr int grid_items_q(int chunks) { return NPEER * NPD * (R9_QC * 4 + (chunks - R9_QC)) + NPD * chunks; }
+constexpr XItem select_item_r9(int t, int chunks) {
+    const int S0 = R9_QC * NPD * 4, g0 = NPEER * S0, S1 = R9_G1 * NPD, g1 = NPEER * S1, S2 = (chunks - R9_QC - R9_G1) * NPD, Rn = g0 + g1 + NPEER * S2;
+    if (t < g0) {                                                  // group 0: slot-major, then (chunk, tile column, quarter); the 4 quarters of a tile are adjacent
+        const int slot = t / S0, u = t % S0, q = u % 4, u2 = u / 4;
+        return {T_QN, u2 / NPD, slot, u2 % NPD, q};
+    }
+    if (t < g0 + g1) {                                             // group 1: full tiles (one chunk row), slot-major
+        const int v = t - g0, slot = v / S1, u = v % S1;
+        return {T_NORMAL, R9_QC + u / NPD, slot, u % NPD, 0};
+    }
+    if (t < Rn) {                                                  // group 2: the remaining full-tile chunk rows, slot-major
+        const int v = t - g0 - g1, slot = v / S2, u = v % S2;
+        return {T_NORMAL, R9_QC + R9_G1 + u / NPD, slot, u % NPD, 0};
+    }
+    const int s = t - Rn;
+    return {T_NORMAL, s / NPD, NPEER, s % NPD, 0};
+}
+constexpr bool r9_order_ok(int chunks) {
+    bool seen_t[32][4][9] = {}; bool cov[32][4][9][2][2] = {};
+    int arr[4][3] = {};
+    for (int t = 0; t < grid_items_q(chunks); ++t) {
+        const XItem x = select_item_r9(t, chunks);
+        if (x.chunk < 0 || x.chunk >= chunks || x.dslot < 0 || x.dslot > NPEER || x.nloc < 0 || x.nloc >= NPD) return false;
+        const int dst = x.dslot < NPEER ? (x.dslot + 1) : 0, g = r9_group_of(x.chunk);
+        if (x.type == T_QN) {
+            if (g != 0 || x.dslot == NPEER || x.nsel < 0 || x.nsel > 3) return false;                      // quarters only in group 0 and only remote
+            const int hn = x.nsel & 1, hm = x.nsel >> 1;
+            if (cov[x.chunk][dst][x.nloc][hn][hm]) return false;
+            cov[x.chunk][dst][x.nloc][hn][hm] = true;
+        } else if (x.type == T_NORMAL) {
+            if (g == 0 && x.dslot != NPEER) return false;                                                    // group-0 remote tiles must be quarters
+            if (seen_t[x.chunk][dst][x.nloc]) return false;
+            seen_t[x.chunk][dst][x.nloc] = true;
+            for (int hn = 0; hn < 2; ++hn) for (int hm = 0; hm < 2; ++hm) { if (cov[x.chunk][dst][x.nloc][hn][hm]) return false; cov[x.chunk][dst][x.nloc][hn][hm] = true; }
+        } else { return false; }
+        if (dst != 0) ++arr[dst][g];
+    }
+    for (int c = 0; c < chunks; ++c) for (int d = 0; d < 4; ++d) for (int n = 0; n < NPD; ++n) for (int hn = 0; hn < 2; ++hn) for (int hm = 0; hm < 2; ++hm) if (!cov[c][d][n][hn][hm]) return false;   // every 128x128 quarter of every tile once
+    for (int d = 1; d < 4; ++d) for (int g = 0; g < R9_NG; ++g) if (arr[d][g] != r9_want(chunks, g)) return false;
+    return true;
+}
+#if !LG_X_INDEXER
+static_assert(r9_order_ok(8) && grid_items_q(8) == 450 && r9_want(8, 0) == 72 && r9_want(8, 1) == 9 && r9_want(8, 2) == 45, "r9 quarter-first plan (M2048, 3 groups 2/1/5 chunks): bijection, quarter coverage, per-group arrivals (72 / 9 / 45), 450 items");
+#endif
+// group helpers: chunk -> put group, group first chunk / chunk count (uneven for HG == 2: 2 / 1 / chunks-3 with NP = 3; even chunks/NP otherwise)
+template<int NP, int HG> __device__ constexpr int group_of_chunk(int c, int chunks) { return HG == 2 ? r9_group_of(c) : c / (chunks / NP); }
+template<int NP, int HG> __device__ constexpr int group_first(int g, int chunks) { return HG == 2 ? r9_g_first(g) : g * (chunks / NP); }
+template<int NP, int HG> __device__ constexpr int group_nchunks(int g, int chunks) { return HG == 2 ? r9_g_n(g, chunks) : chunks / NP; }
+template<int NP, int HG> __device__ constexpr int want_of(int chunks, int g) { return HG == 2 ? r9_want(chunks, g) : (HG ? r7_want(chunks, NP, g) : r6x_group_items(chunks, NP)); }
+template<int NP, int HG> __device__ constexpr int grid_of(int chunks) { return HG == 2 ? grid_items_q(chunks) : grid_items_h(chunks, NP, HG); }
+template<int NP, int HG> __device__ constexpr XItem select_item_h(int t, int chunks) { return HG == 2 ? select_item_r9(t, chunks) : (HG ? select_item_r7(t, chunks, NP) : select_item_r6x(t, chunks, NP)); }
 // r8c: EXPLICIT release form (Evidence ISA gate, review 32f95e line 67): a bare ACQ_REL RMW / release store was lowered as buffer_wbl2 -> lgkm wait -> atomic with NO s_waitcnt vmcnt(0) between the
 // writeback and the atomic/store. Explicit sequence: system release fence (wbl2) -> asm vmcnt(0) (compiler-opaque, memory clobber) -> RELAXED system atomic/store [-> acquire fence for RMWs that acquire].
 __device__ __forceinline__ void rel_fence_vm0() {
@@ -169,7 +230,7 @@ __device__ __forceinline__ void x_publish(const LgCommArgsV2& a, int d0, int d1,
     asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");                // compiler-opaque copy (W-1), every wave before the barrier
     mori::cco::impl::syncThreads();
     if (opus::thread_id_x() == 0) {
-        const uint32_t g = chunk / static_cast<uint32_t>(a.chunks / NP);
+        const uint32_t g = static_cast<uint32_t>(group_of_chunk<NP, HG>(static_cast<int>(chunk), static_cast<int>(a.chunks)));
         const uint32_t cap = static_cast<uint32_t>(want_of<NP, HG>(static_cast<int>(a.chunks), static_cast<int>(g)));
 #if LG_NEGCTRL_NOWB
         // NEGATIVE CONTROL: no release fence (RELAXED RMW): stale S must be detectable
@@ -195,11 +256,12 @@ __device__ __forceinline__ void x_publish(const LgCommArgsV2& a, int d0, int d1,
 }
 
 // ---- one put of group g of `peer`: rows [g*cpp*256, (g+1)*cpp*256) of S_peer -> R_peer[rank]; queue 0; no signal; byte count derived from a.F ----
-template<int NP>
+template<int NP, int HG>
 __device__ __forceinline__ void r6x_put_group(const LgCommArgsV2& a, int peer, uint32_t g) {
-    const uint64_t cpp = a.chunks / NP;
+    const uint64_t c0 = static_cast<uint64_t>(group_first<NP, HG>(static_cast<int>(g), static_cast<int>(a.chunks)));      // first chunk of group g
+    const uint64_t cpp = static_cast<uint64_t>(group_nchunks<NP, HG>(static_cast<int>(g), static_cast<int>(a.chunks)));   // chunks in group g (uneven in the r9 plan)
     const uint64_t slot = 2ull * a.M * a.F;
-    const uint64_t off = g * cpp * 2ull * LG_CHUNK_ROWS * a.F, bytes = cpp * 2ull * LG_CHUNK_ROWS * a.F;
+    const uint64_t off = c0 * 2ull * LG_CHUNK_ROWS * a.F, bytes = cpp * 2ull * LG_CHUNK_ROWS * a.F;
     ccoSdma{a.dev}.template put<ccoCoopThread, false, false, ccoSdmaOptFlagsDefault, ccoSdmaThreadIndependent>(
         peer, a.Rwin, static_cast<size_t>(a.rank) * slot + off, a.Swin, static_cast<size_t>(peer) * slot + off, static_cast<size_t>(bytes), 0u);
 #if LG_DEBUG_POSTCOUNT
@@ -326,11 +388,11 @@ __device__ __forceinline__ void r6_poster_block(const LgCommArgsV2& a) {
 #if LG_X_FORCE_TIMEOUT_G1
         if (g == 1u) { fail(LGC_POISON_POSTER_WAIT); return; }                    // X-A test hook (debug build only): forced g=1 timeout AFTER put(0) was issued
 #endif
-        r6x_put_group<NP>(a, peer, g);
+        r6x_put_group<NP, HG>(a, peer, g);
 #if LG_X_NEG_DOUBLE_PUT
         static_assert(LG_DEBUG_POSTCOUNT, "LG_X_NEG_DOUBLE_PUT needs LG_DEBUG_POSTCOUNT=1");
         if (g == 0u && wave == 1) {                                               // X1-neg: duplicate put of (peer slot 1, group 0): post_count -> 2, second EMPTY->POSTING CAS must fail => poison DUP_CHUNK
-            r6x_put_group<NP>(a, peer, g);
+            r6x_put_group<NP, HG>(a, peer, g);
             uint32_t* st2 = reinterpret_cast<uint32_t*>(cw(a, LGC_STATE_OFF + 4u * (peer * LG_MAX_CHUNKS + g)));
             uint32_t ex2 = LGC_REC_EMPTY;
             if (!__hip_atomic_compare_exchange_strong(st2, &ex2, static_cast<uint32_t>(LGC_REC_POSTING), __ATOMIC_ACQ_REL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) set_poison(a, LGC_POISON_DUP_CHUNK);

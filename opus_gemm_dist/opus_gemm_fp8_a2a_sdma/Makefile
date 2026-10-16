@@ -9,6 +9,9 @@ PLAN             ?= dense
 # FOLD=0 is the production configuration (separate quiet_ready kernel). FOLD=1 folds W2/reset/epoch into the poster block (measured slower at T8192; kept for experiments).
 FOLD             ?= 0
 # Optional debug seams (default off, never for timing): see README "Debug flags".
+# NO_GRIDREAD=1 (default): the WG entry path does NOT read the AQL dispatch packet (grid_size_x); item block 0 checks the real grid off-path after its work and poisons CONFIG on a mismatch.
+# 0 = the old behaviour (every WG reads grid_size_x at entry; for A/B), 2 = no packet read at all (host grid is the only check).
+NO_GRIDREAD      ?= 1
 DEBUG_POSTCOUNT  ?= 0
 STAMPS           ?= 0
 
@@ -40,7 +43,7 @@ OUT   = $(BUILD)/fp8_a2a_sdma_$(PLAN).exe
 
 # Flags shared by every object. -fno-fast-math is REQUIRED: the epilogue is bf16_rne(fp32(fp32(acc*Wscale)*Ascale)) (two separate multiplies, one rounding), and the
 # MFMA/barrier schedule must not be reassociated. BUILD_CCO_SDMA=1 is required (the MORI header default 0 turns SDMA puts into silent no-ops).
-LG_FLAGS     = -DBUILD_CCO_SDMA=1 -DLG_X_INDEXER=$(INDEXER) -DLG_R8_FOLD=$(FOLD) -DLG_REMOTE_HALF=0 -DLG_R6_POSTER=1 -DLG_R6_ARRIVAL_ACQ=0 \
+LG_FLAGS     = -DBUILD_CCO_SDMA=1 -DLG_X_INDEXER=$(INDEXER) -DLG_R8_FOLD=$(FOLD) -DLG_NO_GRIDREAD=$(NO_GRIDREAD) -DLG_REMOTE_HALF=0 -DLG_R6_POSTER=1 -DLG_R6_ARRIVAL_ACQ=0 \
                -DLG_L2B_ONE_RELEASE=1 -DLG_L2A_BYPASS=0 -DLG_L1C_SWIZZLE=0 -DLG_DEBUG_POSTCOUNT=$(DEBUG_POSTCOUNT) -DLG_STAMPS=$(STAMPS)
 COMMON_FLAGS = -I. -I$(abspath $(OPUS_INCLUDE_DIR)) -std=c++20 -fopenmp -O3 -Wall -fno-fast-math --offload-arch=$(ARCH) -DOPUS_TILE_CONTAINER=0 $(LG_FLAGS)
 HOST_INCLUDES = -I$(MORI_INCLUDE_DIR) $(MPI_INCLUDES)
