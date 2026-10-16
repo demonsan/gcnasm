@@ -155,20 +155,21 @@ Source: the private project ledger (confirmations by an independent evidence rol
 | reuse (q/k/v only) | 1.2191 / 1.2189 (n2h) | 1.3363 (n4); 1.3884 in a later window (n2) | 1.3372 (n4); 1.4816 in a later window (n4) |
 
 Two numbers in a cell are two independent windows (ledger r115 dense, r123 indexer T8192, r128/r129 reuse T8192); a single number is the confirming window of r118; "later window" values are the r128 first-window F0 results quoted in the ledger. Dense T = 8192 (r11 n3q, two windows) now also clears 1.20: all 9 large-T cells (3 cases x 3 T) are at or above 1.20 (the indexer/reuse T = 8192 cells are as confirmed with r7 n2h and r8g F0 n2h). Small M (T = 64 / 128) is not part of this directory.
-### Standalone results of this program (r8g-era build: n1/n2/n4/n2h only; the r11 n3q plan and `NO_GRIDREAD` have not been timed standalone yet)
+### Standalone results of this program
 
-GEMM + SDMA chain only (no receiver), MI355X gfx950, 4 ranks on GPUs 4–7, default non-MPI launch (`run_4rank.sh`), eager launches timed with hipEvents, `--warmup 10 --iters 101`, one repeat; reported value is µs per epoch, max over ranks. Validation samples 16 rows per source rank × all packed columns × 4 destinations: `--exact` inputs are byte-equal to the host reference, random inputs pass `rtol = atol = 0.02`, and the poison word is 0 on all ranks.
+GEMM + SDMA chain only (no receiver), MI355X gfx950, 4 ranks on GPUs 4–7, default non-MPI launch (`run_4rank.sh`), default build (`NO_GRIDREAD=1`), eager launches timed with hipEvents, `--warmup 10 --iters 101`, one repeat; reported value is µs per epoch, max over ranks. Validation samples 16 rows per source rank × all packed columns × 4 destinations: `--exact` inputs are byte-equal to the host reference, random inputs pass `rtol = atol = 0.02`, and the poison word is 0 on all ranks. The device code objects are byte-identical to the r11 candidate.
 
-| case | M (rows/rank) | plan | exact-input µs | random-input µs |
-|---|---:|---|---:|---:|
-| dense | 2048 | n1 | 273.55 | 274.87 |
-| dense | 2048 | n2h | 254.59 | 257.03 |
-| dense | 4096 | n2 | 441.54 | 440.59 |
-| dense | 8192 | n4 | 763.26 | 763.24 |
-| indexer | 2048 | n2h | 274.50 | 276.31 |
-| indexer | 4096 | n4 | 458.01 | 467.34 |
-| indexer | 8192 | n4 | 884.48 | 884.51 |
-| reuse (compact q/k/v) | 2048 | n2h | 254.27 | 258.92 |
+| case | M (rows/rank) | plan | exact-input µs | random-input µs | previous build (r8g, grid read) exact µs |
+|---|---:|---|---:|---:|---:|
+| dense | 2048 | n1 | 261.85 | 262.38 | 273.55 |
+| dense | 2048 | n2h | 243.93 | 245.87 | 254.59 |
+| dense | 2048 | **n3q (`--quarter-first`)** | **231.99** | **233.05** | — |
+| dense | 4096 | n2 | 423.72 | 422.27 | 441.54 |
+| dense | 8192 | n4 | 748.53 | 746.96 | 763.26 |
+| indexer | 2048 | n2h | 264.27 | 266.61 | 274.50 |
+| indexer | 4096 | n4 | 441.87 | 452.14 | 458.01 |
+| indexer | 8192 | n4 | 875.20 | 874.50 | 884.48 |
+| reuse (compact q/k/v) | 2048 | n2h | 242.51 | 244.63 | 254.27 |
 
 These numbers are not comparable to the full-chain ratios above, which include the receiver and the graph-replay metric.
 
